@@ -9,6 +9,9 @@ from typing import Optional
 import openai
 from datetime import datetime
 import json
+import httpx
+import PyPDF2
+import io
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -193,41 +196,75 @@ async def parse_cv(
             error=str(e)
         )
 
-@app.post("/parse-file")
-async def parse_cv_file(
+@app.post("/parse-cv")
+async def parse_cv_from_url(
     request: Request,
-    file: UploadFile = File(...),
-    x_hmac_signature: str = Header(None)
+    x_signature: str = Header(None)
 ):
-    """Parse CV file directly with HMAC authentication"""
+    """Parse CV from URL - backend worker endpoint"""
     
     # Verify HMAC signature
-    if not x_hmac_signature:
+    if not x_signature:
         raise HTTPException(status_code=401, detail="Missing HMAC signature")
     
     body = await request.body()
-    if not verify_hmac(x_hmac_signature, body):
+    if not verify_hmac(x_signature, body):
         raise HTTPException(status_code=401, detail="Invalid HMAC signature")
     
     try:
-        # Read file content
-        content = await file.read()
-        content_str = content.decode('utf-8', errors='ignore')
+        # Parse request body
+        payload = json.loads(body)
+        file_url = payload.get('file_url')
+        attachment_id = payload.get('attachment_id')
+        file_hash = payload.get('file_hash')
         
-        # Parse the CV
-        parsed_data = await parse_cv_with_openai(content_str, file.filename)
+        if not file_url:
+            raise HTTPException(status_code=400, detail="file_url is required")
         
-        return ParseResponse(
-            success=True,
-            data=parsed_data
-        )
+        # Fetch file from URL
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(file_url)
+            response.raise_for_status()
+            file_content = response.content
+        
+        # Extract text from PDF
+        text_content = extract_text_from_pdf(file_content)
+        
+        # Parse with OpenAI
+        parsed_data = await parse_cv_with_openai(text_content, attachment_id or "unknown")
+        
+        # Return in expected format
+        return {
+            "schema_version": "v1",
+            "attachment_id": attachment_id,
+            "file_hash": file_hash,
+            "extracted_at": datetime.utcnow().isoformat(),
+            "candidate": parsed_data
+        }
     
+    except httpx.HTTPError as e:
+        logger.error(f"Failed to fetch file: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch file: {str(e)}")
     except Exception as e:
-        logger.error(f"File parse error: {e}")
-        return ParseResponse(
-            success=False,
-            error=str(e)
-        )
+        logger.error(f"Parse error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+def extract_text_from_pdf(pdf_content: bytes) -> str:
+    """Extract text from PDF bytes"""
+    try:
+        pdf_file = io.BytesIO(pdf_content)
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        
+        text_parts = []
+        for page in pdf_reader.pages:
+            text_parts.append(page.extract_text())
+        
+        full_text = "\n".join(text_parts)
+        logger.info(f"Extracted {len(full_text)} characters from PDF")
+        return full_text
+    except Exception as e:
+        logger.error(f"PDF extraction error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to extract PDF text: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
