@@ -109,7 +109,7 @@ Return only the JSON object, no explanation.
 """
 
         response = openai.chat.completions.create(
-            model="gpt-4",
+            model="gpt-4o-mini",  # Cost-effective model: ~$0.15/1M input tokens (200x cheaper than GPT-4)
             messages=[
                 {"role": "system", "content": "You are a precise CV parser that returns only valid JSON."},
                 {"role": "user", "content": prompt}
