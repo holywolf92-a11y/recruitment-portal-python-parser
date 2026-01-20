@@ -413,6 +413,174 @@ def upload_photo_to_supabase(image_bytes: bytes, attachment_id: str, file_ext: s
         logger.error(f"[PhotoUpload] Traceback: {traceback.format_exc()}")
         return None
 
+async def categorize_document_with_ai(file_content: str, file_name: str, mime_type: str) -> dict:
+    """
+    Use OpenAI to categorize document and extract identity fields.
+    
+    Returns:
+    {
+        "category": "cv_resume" | "passport" | "certificates" | "contracts" | "medical_reports" | "photos" | "other_documents",
+        "confidence": 0.0-1.0,
+        "ocr_confidence": 0.0-1.0,
+        "extracted_identity": {
+            "name": "string or null",
+            "father_name": "string or null",
+            "cnic": "string or null",
+            "passport_no": "string or null",
+            "email": "string or null",
+            "phone": "string or null",
+            "date_of_birth": "string or null",
+            "document_number": "string or null"
+        }
+    }
+    """
+    try:
+        # Decode base64 content
+        import base64
+        file_bytes = base64.b64decode(file_content)
+        
+        # Extract text from document
+        text_content = ""
+        if mime_type == "application/pdf":
+            text_content = extract_text_from_pdf(file_bytes)
+        else:
+            # For non-PDF files, try to decode as text
+            try:
+                text_content = file_bytes.decode('utf-8', errors='ignore')
+            except:
+                text_content = str(file_bytes)
+        
+        logger.info(f"[DocumentCategorization] Extracted {len(text_content)} characters from {file_name}")
+        
+        # Prepare OpenAI prompt for document categorization
+        prompt = f"""
+You are a document classification and identity extraction AI. Analyze the following document content and provide:
+
+1. Document category (choose ONE):
+   - cv_resume: CV, resume, curriculum vitae
+   - passport: Passport copy, passport scan
+   - certificates: Educational certificates, degrees, diplomas, training certificates
+   - contracts: Employment contracts, offer letters, agreements
+   - medical_reports: Medical test reports, health certificates, fitness certificates
+   - photos: Passport photos, ID photos
+   - other_documents: Any other document type
+
+2. Confidence score (0.0 to 1.0) for the category classification
+
+3. Extract identity fields from the document:
+   - name: Full name of the person
+   - father_name: Father's name (common in Pakistani documents)
+   - cnic: Pakistani CNIC number (format: 12345-1234567-1 or 13 digits)
+   - passport_no: Passport number
+   - email: Email address
+   - phone: Phone number
+   - date_of_birth: Date of birth (any format)
+   - document_number: Any other ID number found in the document
+
+Return ONLY valid JSON with this exact structure:
+{{
+  "category": "category_name",
+  "confidence": 0.95,
+  "ocr_confidence": 0.90,
+  "extracted_identity": {{
+    "name": "string or null",
+    "father_name": "string or null",
+    "cnic": "string or null",
+    "passport_no": "string or null",
+    "email": "string or null",
+    "phone": "string or null",
+    "date_of_birth": "string or null",
+    "document_number": "string or null"
+  }}
+}}
+
+Document filename: {file_name}
+Document content:
+{text_content[:3000]}
+"""
+
+        # Call OpenAI
+        response = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a document classification expert. Return ONLY valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+            max_tokens=500
+        )
+        
+        result_text = response.choices[0].message.content.strip()
+        
+        # Clean up markdown code blocks if present
+        if result_text.startswith("```json"):
+            result_text = result_text[7:]
+        elif result_text.startswith("```"):
+            result_text = result_text[3:]
+        if result_text.endswith("```"):
+            result_text = result_text[:-3]
+        
+        result_text = result_text.strip()
+        parsed_result = json.loads(result_text)
+        
+        logger.info(f"[DocumentCategorization] Categorized as: {parsed_result.get('category')} (confidence: {parsed_result.get('confidence')})")
+        
+        return parsed_result
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"[DocumentCategorization] JSON decode error: {e}, response: {result_text}")
+        raise HTTPException(status_code=500, detail=f"Failed to parse AI response: {str(e)}")
+    except Exception as e:
+        logger.error(f"[DocumentCategorization] Categorization error: {e}")
+        raise HTTPException(status_code=500, detail=f"Document categorization failed: {str(e)}")
+
+@app.post("/categorize-document")
+async def categorize_document(
+    request: Request,
+    x_hmac_signature: str = Header(None)
+):
+    """
+    Categorize document and extract identity fields using AI.
+    Protected with HMAC authentication.
+    """
+    
+    # Verify HMAC signature
+    if not x_hmac_signature:
+        raise HTTPException(status_code=401, detail="Missing HMAC signature")
+    
+    body = await request.body()
+    if not verify_hmac(x_hmac_signature, body):
+        raise HTTPException(status_code=401, detail="Invalid HMAC signature")
+    
+    try:
+        # Parse request body
+        payload = json.loads(body)
+        file_content = payload.get('file_content')
+        file_name = payload.get('file_name', 'unknown')
+        mime_type = payload.get('mime_type', 'application/pdf')
+        
+        if not file_content:
+            raise HTTPException(status_code=400, detail="file_content is required")
+        
+        # Categorize document
+        result = await categorize_document_with_ai(file_content, file_name, mime_type)
+        
+        return {
+            "success": True,
+            "category": result.get("category"),
+            "confidence": result.get("confidence"),
+            "ocr_confidence": result.get("ocr_confidence"),
+            "extracted_identity": result.get("extracted_identity"),
+            "raw_text": None  # Don't return raw text to reduce payload size
+        }
+    
+    except Exception as e:
+        logger.error(f"[CategorizeDocument] Error: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
