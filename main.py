@@ -77,9 +77,14 @@ Return ONLY valid JSON with these exact fields (use null for missing data):
   "email": "string or null",
   "phone": "string or null",
   "location": "string or null",
+  "nationality": "string or null (country of origin/citizenship)",
+  "position": "string or null (desired job position/profession/title)",
+  "experience_years": "number or null (total years of professional work experience)",
+  "country_of_interest": "string or null (country they want to work in, check objective/career goals)",
   "linkedin_url": "string or null",
   "summary": "string or null",
-  "skills": ["array of strings"],
+  "professional_summary": "string or null (2-3 sentence career summary)",
+  "skills": ["array of strings - all technical and professional skills"],
   "experience": [
     {{
       "title": "string",
@@ -99,8 +104,19 @@ Return ONLY valid JSON with these exact fields (use null for missing data):
     }}
   ],
   "certifications": ["array of strings"],
-  "languages": ["array of strings"]
+  "languages": ["array of strings"],
+  "previous_employment": "string or null (brief summary of work history)",
+  "passport_expiry": "string or null (format: YYYY-MM-DD)"
 }}
+
+IMPORTANT Guidelines:
+- Extract nationality from personal info, birthplace, or passport details
+- Extract position from objective, desired role, or most recent job title
+- Calculate experience_years from work history timeline if not stated
+- Look for country_of_interest in objective/goal statements (e.g., "seeking opportunities in UAE")
+- Extract ALL skills mentioned (technical, soft skills, software, languages, certifications)
+- For skills, include programming languages, tools, frameworks, soft skills
+- Be thorough in skills extraction - don't miss any mentioned abilities
 
 CV Content:
 {content[:4000]}
@@ -130,6 +146,10 @@ Return only the JSON object, no explanation.
         
         result_text = result_text.strip()
         parsed_data = json.loads(result_text)
+        
+        # Add "missing" default for country_of_interest if null or empty
+        if not parsed_data.get('country_of_interest'):
+            parsed_data['country_of_interest'] = 'missing'
         
         logger.info(f"Successfully parsed CV: {filename}")
         return parsed_data
