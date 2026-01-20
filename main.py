@@ -15,6 +15,7 @@ import io
 import fitz  # PyMuPDF
 from PIL import Image
 import base64
+from supabase import create_client
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -380,36 +381,26 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
         return None  # Graceful fallback - don't fail CV parsing if photo extraction fails
 
 def upload_photo_to_supabase(image_bytes: bytes, attachment_id: str, file_ext: str) -> str:
-    """Upload extracted photo to Supabase Storage bucket"""
+    """Upload extracted photo to Supabase Storage bucket using supabase-py client"""
     try:
         if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
             logger.warning("[PhotoUpload] Supabase credentials not configured, skipping photo upload")
             return None
+        
+        logger.info(f"[PhotoUpload] Initializing Supabase client...")
+        supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
         
         # Bucket and file path
         bucket_name = "documents"
         file_path = f"candidate_photos/{attachment_id}/profile.{file_ext}"
         
         logger.info(f"[PhotoUpload] Uploading to: {bucket_name}/{file_path}")
+        logger.info(f"[PhotoUpload] Image size: {len(image_bytes):,} bytes")
         
-        # Upload using Supabase Storage API
-        upload_url = f"{SUPABASE_URL}/storage/v1/object/{bucket_name}/{file_path}"
+        # Upload using Supabase client
+        response = supabase.storage.from_(bucket_name).upload(file_path, image_bytes)
         
-        headers = {
-            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-            "Content-Type": f"image/{file_ext}",
-        }
-        
-        # Use synchronous requests for Supabase upload
-        import requests
-        response = requests.post(upload_url, data=image_bytes, headers=headers)
-        
-        logger.info(f"[PhotoUpload] Upload response status: {response.status_code}")
-        
-        if response.status_code not in [200, 201]:
-            logger.error(f"[PhotoUpload] Supabase upload failed: {response.status_code}")
-            logger.error(f"[PhotoUpload] Response: {response.text}")
-            return None
+        logger.info(f"[PhotoUpload] Upload response: {response}")
         
         # Return public URL
         public_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket_name}/{file_path}"
