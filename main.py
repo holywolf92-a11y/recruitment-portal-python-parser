@@ -308,20 +308,25 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
         pdf_document = fitz.open(stream=pdf_content, filetype="pdf")
         
         if pdf_document.page_count == 0:
-            logger.info("PDF has no pages, skipping photo extraction")
+            logger.info(f"[PhotoExtraction] PDF has no pages for attachment {attachment_id}")
             return None
+        
+        logger.info(f"[PhotoExtraction] PDF has {pdf_document.page_count} pages")
         
         # Check first page only (profile photos are usually on page 1)
         first_page = pdf_document[0]
         image_list = first_page.get_images(full=True)
         
+        logger.info(f"[PhotoExtraction] Found {len(image_list)} images on first page")
+        
         if not image_list:
-            logger.info("No images found in PDF first page")
+            logger.info(f"[PhotoExtraction] No images found in PDF first page for {attachment_id}")
             return None
         
         # Find largest image (likely the profile photo)
         largest_image = None
         largest_size = 0
+        all_sizes = []
         
         for img_index, img_info in enumerate(image_list):
             xref = img_info[0]
@@ -331,22 +336,28 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
             
             # Calculate image size
             image_size = len(image_bytes)
+            all_sizes.append((image_size, image_ext))
             
-            # Profile photos are typically 10KB-500KB
+            logger.info(f"[PhotoExtraction] Image {img_index}: {image_size} bytes ({image_ext})")
+            
+            # Profile photos are typically 5KB-1MB (relaxed from 10KB-500KB)
             # Skip very small images (icons/logos) and very large images (full-page scans)
-            if 10000 < image_size < 500000 and image_size > largest_size:
+            if 5000 < image_size < 1000000 and image_size > largest_size:
                 largest_image = {
                     "bytes": image_bytes,
                     "ext": image_ext,
                     "size": image_size
                 }
                 largest_size = image_size
+                logger.info(f"[PhotoExtraction] Selected image {img_index} as potential profile photo ({image_size} bytes)")
         
         pdf_document.close()
         
         if not largest_image:
-            logger.info("No suitable profile photo found (all images too small/large)")
+            logger.info(f"[PhotoExtraction] No suitable profile photo found. Images found: {all_sizes}")
             return None
+        
+        logger.info(f"[PhotoExtraction] Uploading profile photo ({largest_image['size']} bytes)")
         
         # Upload to Supabase Storage
         photo_url = upload_photo_to_supabase(
@@ -355,23 +366,31 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
             largest_image["ext"]
         )
         
-        logger.info(f"Successfully extracted and uploaded profile photo: {photo_url}")
+        if photo_url:
+            logger.info(f"[PhotoExtraction] Successfully extracted and uploaded profile photo: {photo_url}")
+        else:
+            logger.warning(f"[PhotoExtraction] Photo extracted but upload returned None")
+        
         return photo_url
         
     except Exception as e:
-        logger.warning(f"Photo extraction failed (non-critical): {e}")
+        logger.warning(f"[PhotoExtraction] Photo extraction failed (non-critical): {e}")
+        import traceback
+        logger.warning(f"[PhotoExtraction] Traceback: {traceback.format_exc()}")
         return None  # Graceful fallback - don't fail CV parsing if photo extraction fails
 
 def upload_photo_to_supabase(image_bytes: bytes, attachment_id: str, file_ext: str) -> str:
     """Upload extracted photo to Supabase Storage bucket"""
     try:
         if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-            logger.warning("Supabase credentials not configured, skipping photo upload")
+            logger.warning("[PhotoUpload] Supabase credentials not configured, skipping photo upload")
             return None
         
         # Bucket and file path
         bucket_name = "documents"
         file_path = f"candidate_photos/{attachment_id}/profile.{file_ext}"
+        
+        logger.info(f"[PhotoUpload] Uploading to: {bucket_name}/{file_path}")
         
         # Upload using Supabase Storage API
         upload_url = f"{SUPABASE_URL}/storage/v1/object/{bucket_name}/{file_path}"
@@ -385,16 +404,22 @@ def upload_photo_to_supabase(image_bytes: bytes, attachment_id: str, file_ext: s
         import requests
         response = requests.post(upload_url, data=image_bytes, headers=headers)
         
+        logger.info(f"[PhotoUpload] Upload response status: {response.status_code}")
+        
         if response.status_code not in [200, 201]:
-            logger.error(f"Supabase upload failed: {response.status_code} - {response.text}")
+            logger.error(f"[PhotoUpload] Supabase upload failed: {response.status_code}")
+            logger.error(f"[PhotoUpload] Response: {response.text}")
             return None
         
         # Return public URL
         public_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket_name}/{file_path}"
+        logger.info(f"[PhotoUpload] Success! Public URL: {public_url}")
         return public_url
         
     except Exception as e:
-        logger.error(f"Photo upload error: {e}")
+        logger.error(f"[PhotoUpload] Photo upload error: {e}")
+        import traceback
+        logger.error(f"[PhotoUpload] Traceback: {traceback.format_exc()}")
         return None
 
 if __name__ == "__main__":
