@@ -12,6 +12,9 @@ import json
 import httpx
 import PyPDF2
 import io
+import fitz  # PyMuPDF
+from PIL import Image
+import base64
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,6 +35,8 @@ app.add_middleware(
 HMAC_SECRET = os.getenv("PYTHON_HMAC_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 if not HMAC_SECRET:
     raise ValueError("PYTHON_HMAC_SECRET environment variable is required")
@@ -250,8 +255,15 @@ async def parse_cv_from_url(
         # Extract text from PDF
         text_content = extract_text_from_pdf(file_content)
         
+        # Extract profile photo (non-blocking - won't fail if extraction fails)
+        profile_photo_url = extract_profile_photo_from_pdf(file_content, attachment_id or "unknown")
+        
         # Parse with OpenAI
         parsed_data = await parse_cv_with_openai(text_content, attachment_id or "unknown")
+        
+        # Add profile photo URL to parsed data if extracted
+        if profile_photo_url:
+            parsed_data['profile_photo_url'] = profile_photo_url
         
         # Return in expected format
         return {
@@ -285,6 +297,105 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
     except Exception as e:
         logger.error(f"PDF extraction error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to extract PDF text: {str(e)}")
+
+def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Optional[str]:
+    """
+    Extract profile photo from PDF and upload to Supabase Storage.
+    Returns the public URL of the uploaded photo, or None if no photo found.
+    """
+    try:
+        # Open PDF with PyMuPDF
+        pdf_document = fitz.open(stream=pdf_content, filetype="pdf")
+        
+        if pdf_document.page_count == 0:
+            logger.info("PDF has no pages, skipping photo extraction")
+            return None
+        
+        # Check first page only (profile photos are usually on page 1)
+        first_page = pdf_document[0]
+        image_list = first_page.get_images(full=True)
+        
+        if not image_list:
+            logger.info("No images found in PDF first page")
+            return None
+        
+        # Find largest image (likely the profile photo)
+        largest_image = None
+        largest_size = 0
+        
+        for img_index, img_info in enumerate(image_list):
+            xref = img_info[0]
+            base_image = pdf_document.extract_image(xref)
+            image_bytes = base_image["image"]
+            image_ext = base_image["ext"]
+            
+            # Calculate image size
+            image_size = len(image_bytes)
+            
+            # Profile photos are typically 10KB-500KB
+            # Skip very small images (icons/logos) and very large images (full-page scans)
+            if 10000 < image_size < 500000 and image_size > largest_size:
+                largest_image = {
+                    "bytes": image_bytes,
+                    "ext": image_ext,
+                    "size": image_size
+                }
+                largest_size = image_size
+        
+        pdf_document.close()
+        
+        if not largest_image:
+            logger.info("No suitable profile photo found (all images too small/large)")
+            return None
+        
+        # Upload to Supabase Storage
+        photo_url = upload_photo_to_supabase(
+            largest_image["bytes"],
+            attachment_id,
+            largest_image["ext"]
+        )
+        
+        logger.info(f"Successfully extracted and uploaded profile photo: {photo_url}")
+        return photo_url
+        
+    except Exception as e:
+        logger.warning(f"Photo extraction failed (non-critical): {e}")
+        return None  # Graceful fallback - don't fail CV parsing if photo extraction fails
+
+def upload_photo_to_supabase(image_bytes: bytes, attachment_id: str, file_ext: str) -> str:
+    """Upload extracted photo to Supabase Storage bucket"""
+    try:
+        if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+            logger.warning("Supabase credentials not configured, skipping photo upload")
+            return None
+        
+        # Bucket and file path
+        bucket_name = "documents"
+        file_path = f"candidate_photos/{attachment_id}/profile.{file_ext}"
+        
+        # Upload using Supabase Storage API
+        upload_url = f"{SUPABASE_URL}/storage/v1/object/{bucket_name}/{file_path}"
+        
+        headers = {
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type": f"image/{file_ext}",
+        }
+        
+        # Use synchronous requests for Supabase upload
+        import requests
+        response = requests.post(upload_url, data=image_bytes, headers=headers)
+        
+        if response.status_code not in [200, 201]:
+            logger.error(f"Supabase upload failed: {response.status_code} - {response.text}")
+            return None
+        
+        # Return public URL
+        public_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket_name}/{file_path}"
+        return public_url
+        
+    except Exception as e:
+        logger.error(f"Photo upload error: {e}")
+        return None
 
 if __name__ == "__main__":
     import uvicorn
