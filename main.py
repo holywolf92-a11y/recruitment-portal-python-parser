@@ -564,20 +564,27 @@ async def categorize_document(
         
         # Categorize document
         result = await categorize_document_with_ai(file_content, file_name, mime_type)
-        
+        # Ensure all required fields are present, even if null
         return {
             "success": True,
-            "category": result.get("category"),
-            "confidence": result.get("confidence"),
-            "ocr_confidence": result.get("ocr_confidence"),
-            "extracted_identity": result.get("extracted_identity"),
+            "category": result.get("category", None),
+            "confidence": result.get("confidence", None),
+            "ocr_confidence": result.get("ocr_confidence", None),
+            "extracted_identity": result.get("extracted_identity", None),
+            "mismatch_fields": result.get("mismatch_fields", []),
             "raw_text": None  # Don't return raw text to reduce payload size
         }
-    
     except Exception as e:
         logger.error(f"[CategorizeDocument] Error: {e}")
+        # Always return all required fields as null/empty on error
         return {
             "success": False,
+            "category": None,
+            "confidence": None,
+            "ocr_confidence": None,
+            "extracted_identity": None,
+            "mismatch_fields": [],
+            "raw_text": None,
             "error": str(e)
         }
 
