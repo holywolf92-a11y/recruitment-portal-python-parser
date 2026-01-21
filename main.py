@@ -719,19 +719,33 @@ async def categorize_document(
         file_name = payload.get('file_name', 'unknown')
         mime_type = payload.get('mime_type', 'application/pdf')
         
+        # Log what we received
+        logger.info(f"[CategorizeDocument] Received request - fileName: {file_name}, mimeType: {mime_type}")
+        logger.info(f"[CategorizeDocument] file_content type: {type(file_content)}, length: {len(file_content) if file_content else 0}")
+        if file_content:
+            logger.info(f"[CategorizeDocument] file_content first 100 chars: {file_content[:100]}")
+            logger.info(f"[CategorizeDocument] file_content last 20 chars: {file_content[-20:]}")
+        
         if not file_content:
             raise HTTPException(status_code=400, detail="file_content is required")
         
         # Validate base64 string
         if isinstance(file_content, str):
+            original_content = file_content
             # Remove any whitespace and newlines
             file_content = file_content.strip().replace('\n', '').replace('\r', '')
+            
+            # Log after cleaning
+            if original_content != file_content:
+                logger.info(f"[CategorizeDocument] Cleaned whitespace - original length: {len(original_content)}, cleaned length: {len(file_content)}")
+            
             # Check if this looks like base64 (only base64 chars: A-Z, a-z, 0-9, +, /, =)
             import re
             base64_pattern = re.compile(r'^[A-Za-z0-9+/]*={0,2}$')
             if not base64_pattern.match(file_content):
                 # This is not base64 - it's probably raw text content
                 logger.error(f"[CategorizeDocument] Received non-base64 content. First 100 chars: {file_content[:100]}")
+                logger.error(f"[CategorizeDocument] Content contains invalid chars. Sample: {repr(file_content[:200])}")
                 raise HTTPException(status_code=400, detail="file_content must be base64-encoded, not raw text")
             # Base64 strings should be multiples of 4 (with padding)
             # Add padding if needed
