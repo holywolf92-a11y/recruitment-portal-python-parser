@@ -585,9 +585,10 @@ async def categorize_document_with_ai(file_content: str, file_name: str, mime_ty
                 file_content += '=' * (4 - missing_padding)
         
         try:
-            file_bytes = base64.b64decode(file_content, validate=True)
+            # Use validate=False to be more lenient with padding
+            file_bytes = base64.b64decode(file_content, validate=False)
         except Exception as decode_error:
-            logger.error(f"[DocumentCategorization] Base64 decode error: {decode_error}, content length: {len(file_content) if file_content else 0}")
+            logger.error(f"[DocumentCategorization] Base64 decode error: {decode_error}, content length: {len(file_content) if file_content else 0}, first 50 chars: {file_content[:50] if file_content else 'None'}")
             raise HTTPException(status_code=400, detail=f"Invalid base64-encoded file content: {str(decode_error)}")
         
         # Extract text from document
