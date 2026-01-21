@@ -746,12 +746,17 @@ async def categorize_document(
                 # This is not base64 - it's probably raw text content
                 logger.error(f"[CategorizeDocument] Received non-base64 content. First 100 chars: {file_content[:100]}")
                 logger.error(f"[CategorizeDocument] Content contains invalid chars. Sample: {repr(file_content[:200])}")
+                logger.error(f"[CategorizeDocument] Original content (before cleaning): {repr(original_content[:200])}")
                 raise HTTPException(status_code=400, detail="file_content must be base64-encoded, not raw text")
+            
             # Base64 strings should be multiples of 4 (with padding)
             # Add padding if needed
             missing_padding = len(file_content) % 4
             if missing_padding:
                 file_content += '=' * (4 - missing_padding)
+            
+            # Log validated base64 before passing to categorize function
+            logger.info(f"[CategorizeDocument] Validated base64 - length: {len(file_content)}, first 50 chars: {file_content[:50]}")
         
         # Categorize document
         result = await categorize_document_with_ai(file_content, file_name, mime_type)
