@@ -240,15 +240,11 @@ Return only the JSON object, no explanation.
 
         result_text = result_text.strip()
         parsed_data = json.loads(result_text)
-<<<<<<< HEAD
         
         # Add "missing" default for country_of_interest if null or empty
         if not parsed_data.get('country_of_interest'):
             parsed_data['country_of_interest'] = 'missing'
         
-=======
-
->>>>>>> 81bec3ecd8362c205161435a2e2ff581a22cd6a8
         logger.info(f"Successfully parsed CV: {filename}")
         return parsed_data
 
@@ -398,7 +394,6 @@ async def parse_cv_from_url(
 
         # Extract text from PDF
         text_content = extract_text_from_pdf(file_content)
-<<<<<<< HEAD
         
         # Extract profile photo (non-blocking - won't fail if extraction fails)
         profile_photo_url = extract_profile_photo_from_pdf(file_content, attachment_id or "unknown")
@@ -410,12 +405,6 @@ async def parse_cv_from_url(
         if profile_photo_url:
             parsed_data['profile_photo_url'] = profile_photo_url
         
-=======
-
-        # Parse with OpenAI
-        parsed_data = await parse_cv_with_openai(text_content, attachment_id or "unknown")
-
->>>>>>> 81bec3ecd8362c205161435a2e2ff581a22cd6a8
         # Return in expected format
         return {
             "schema_version": "v1",
