@@ -673,7 +673,15 @@ Document content:
         result_text = result_text.strip()
         parsed_result = json.loads(result_text)
         
+        # Ensure extracted_identity exists and filter out null values for logging
+        extracted_identity = parsed_result.get('extracted_identity', {})
+        non_null_identity = {k: v for k, v in extracted_identity.items() if v is not None} if extracted_identity else {}
+        
         logger.info(f"[DocumentCategorization] Categorized as: {parsed_result.get('category')} (confidence: {parsed_result.get('confidence')})")
+        if non_null_identity:
+            logger.info(f"[DocumentCategorization] Extracted identity fields: {list(non_null_identity.keys())}")
+        else:
+            logger.warning(f"[DocumentCategorization] No identity fields extracted from document")
         
         return parsed_result
         
