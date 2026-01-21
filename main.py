@@ -275,56 +275,8 @@ async def health():
         "hmac_configured": bool(HMAC_SECRET)
     }
 
-@app.post("/categorize-document")
-async def categorize_document(
-    request: Request,
-    categorize_request: CategorizeRequest,
-    x_hmac_signature: str = Header(None)
-):
-    """Categorize document and extract identity fields with HMAC authentication"""
-
-    # Verify HMAC signature
-    if not x_hmac_signature:
-        raise HTTPException(status_code=401, detail="Missing HMAC signature")
-
-    body = await request.body()
-    if not verify_hmac(x_hmac_signature, body):
-        raise HTTPException(status_code=401, detail="Invalid HMAC signature")
-
-    try:
-        # Decode base64 file content
-        try:
-            file_bytes = base64.b64decode(categorize_request.file_content)
-            file_text = file_bytes.decode('utf-8', errors='ignore')
-        except Exception as e:
-            logger.warning(f"Failed to decode as text, trying PDF extraction: {e}")
-            # If not text, try PDF extraction
-            try:
-                file_bytes = base64.b64decode(categorize_request.file_content)
-                file_text = extract_text_from_pdf(file_bytes)
-            except Exception as pdf_error:
-                logger.error(f"Failed to extract text from file: {pdf_error}")
-                raise HTTPException(status_code=400, detail=f"Could not extract text from file: {str(pdf_error)}")
-
-        # Categorize the document
-        result = await categorize_document_with_ai(
-            file_text,
-            categorize_request.file_name,
-            categorize_request.candidate_data
-        )
-
-        return {
-            "success": True,
-            "category": result.get("category"),
-            "confidence": result.get("confidence", 0.0),
-            "identity_fields": result.get("identity_fields", {})
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Categorization error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+# REMOVED: Duplicate /categorize-document endpoint
+# The correct endpoint is at line 697 which manually parses JSON and validates base64
 
 @app.post("/parse", response_model=ParseResponse)
 async def parse_cv(
