@@ -724,8 +724,15 @@ async def categorize_document(
         
         # Validate base64 string
         if isinstance(file_content, str):
-            # Remove any whitespace
-            file_content = file_content.strip()
+            # Remove any whitespace and newlines
+            file_content = file_content.strip().replace('\n', '').replace('\r', '')
+            # Check if this looks like base64 (only base64 chars: A-Z, a-z, 0-9, +, /, =)
+            import re
+            base64_pattern = re.compile(r'^[A-Za-z0-9+/]*={0,2}$')
+            if not base64_pattern.match(file_content):
+                # This is not base64 - it's probably raw text content
+                logger.error(f"[CategorizeDocument] Received non-base64 content. First 100 chars: {file_content[:100]}")
+                raise HTTPException(status_code=400, detail="file_content must be base64-encoded, not raw text")
             # Base64 strings should be multiples of 4 (with padding)
             # Add padding if needed
             missing_padding = len(file_content) % 4
