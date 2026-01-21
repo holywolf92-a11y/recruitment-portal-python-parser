@@ -5,7 +5,7 @@ import hmac
 import hashlib
 import os
 import logging
-from typing import Optional
+from typing import Optional, Dict, Any
 import openai
 from datetime import datetime
 import json
@@ -16,6 +16,7 @@ import fitz  # PyMuPDF
 from PIL import Image
 import base64
 from supabase import create_client
+import re
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -53,6 +54,12 @@ class ParseRequest(BaseModel):
     file_name: str
     mime_type: str
 
+class CategorizeRequest(BaseModel):
+    file_content: str
+    file_name: str
+    mime_type: str
+    candidate_data: Optional[Dict[str, Any]] = None
+
 class ParseResponse(BaseModel):
     success: bool
     data: Optional[dict] = None
@@ -70,6 +77,87 @@ def verify_hmac(signature: str, body: bytes) -> bool:
     except Exception as e:
         logger.error(f"HMAC verification error: {e}")
         return False
+
+async def categorize_document_with_ai(content: str, filename: str, candidate_data: dict = None) -> dict:
+    """Categorize document and extract identity fields using OpenAI"""
+    try:
+        prompt = f"""
+You are a document classifier and identity extractor. Analyze the document and:
+1. Classify it into ONE category
+2. Extract identity information
+
+CATEGORIES (choose ONE):
+- cv_resume: CV, resume, or employment history
+- passport: Passport document
+- certificates: Degrees, diplomas, certifications
+- contracts: Employment contracts, agreements
+- medical_reports: Medical certificates, health reports
+- photos: Profile pictures, headshots
+- other_documents: Any other document type
+
+IDENTITY FIELDS TO EXTRACT (return null if not found):
+- name: Full name of the person
+- cnic: Pakistani CNIC (format: 12345-1234567-1)
+- passport_no: Passport number
+- email: Email address
+- phone: Phone number
+- dob: Date of birth
+- document_number: Any other ID number found
+
+Document Content:
+{content[:4000]}
+
+Candidate Info (for reference):
+{json.dumps(candidate_data) if candidate_data else "None"}
+
+Return ONLY valid JSON:
+{{
+  "category": "one_of_the_categories_above",
+  "confidence": 0.0_to_1.0,
+  "identity_fields": {{
+    "name": "string or null",
+    "cnic": "string or null",
+    "passport_no": "string or null",
+    "email": "string or null",
+    "phone": "string or null",
+    "dob": "string or null",
+    "document_number": "string or null"
+  }}
+}}
+"""
+
+        response = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a precise document classifier that returns only valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+            max_tokens=500
+        )
+
+        result_text = response.choices[0].message.content.strip()
+        
+        # Remove markdown code blocks if present
+        if result_text.startswith("```json"):
+            result_text = result_text[7:]
+        if result_text.startswith("```"):
+            result_text = result_text[3:]
+        if result_text.endswith("```"):
+            result_text = result_text[:-3]
+
+        result_text = result_text.strip()
+        parsed_data = json.loads(result_text)
+
+        logger.info(f"Categorized document: {filename} as {parsed_data.get('category')} with confidence {parsed_data.get('confidence')}")
+        return parsed_data
+
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error: {e}, response: {result_text}")
+        raise HTTPException(status_code=500, detail=f"Failed to parse OpenAI response as JSON: {str(e)}")
+    except Exception as e:
+        logger.error(f"OpenAI categorization error: {e}")
+        raise HTTPException(status_code=500, detail=f"Document categorization failed: {str(e)}")
 
 async def parse_cv_with_openai(content: str, filename: str) -> dict:
     """Parse CV content using OpenAI"""
@@ -131,7 +219,7 @@ Return only the JSON object, no explanation.
 """
 
         response = openai.chat.completions.create(
-            model="gpt-4o-mini",  # Cost-effective model: ~$0.15/1M input tokens (200x cheaper than GPT-4)
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a precise CV parser that returns only valid JSON."},
                 {"role": "user", "content": prompt}
@@ -149,14 +237,18 @@ Return only the JSON object, no explanation.
             result_text = result_text[3:]
         if result_text.endswith("```"):
             result_text = result_text[:-3]
-        
+
         result_text = result_text.strip()
         parsed_data = json.loads(result_text)
+<<<<<<< HEAD
         
         # Add "missing" default for country_of_interest if null or empty
         if not parsed_data.get('country_of_interest'):
             parsed_data['country_of_interest'] = 'missing'
         
+=======
+
+>>>>>>> 81bec3ecd8362c205161435a2e2ff581a22cd6a8
         logger.info(f"Successfully parsed CV: {filename}")
         return parsed_data
 
@@ -187,6 +279,57 @@ async def health():
         "hmac_configured": bool(HMAC_SECRET)
     }
 
+@app.post("/categorize-document")
+async def categorize_document(
+    request: Request,
+    categorize_request: CategorizeRequest,
+    x_hmac_signature: str = Header(None)
+):
+    """Categorize document and extract identity fields with HMAC authentication"""
+
+    # Verify HMAC signature
+    if not x_hmac_signature:
+        raise HTTPException(status_code=401, detail="Missing HMAC signature")
+
+    body = await request.body()
+    if not verify_hmac(x_hmac_signature, body):
+        raise HTTPException(status_code=401, detail="Invalid HMAC signature")
+
+    try:
+        # Decode base64 file content
+        try:
+            file_bytes = base64.b64decode(categorize_request.file_content)
+            file_text = file_bytes.decode('utf-8', errors='ignore')
+        except Exception as e:
+            logger.warning(f"Failed to decode as text, trying PDF extraction: {e}")
+            # If not text, try PDF extraction
+            try:
+                file_bytes = base64.b64decode(categorize_request.file_content)
+                file_text = extract_text_from_pdf(file_bytes)
+            except Exception as pdf_error:
+                logger.error(f"Failed to extract text from file: {pdf_error}")
+                raise HTTPException(status_code=400, detail=f"Could not extract text from file: {str(pdf_error)}")
+
+        # Categorize the document
+        result = await categorize_document_with_ai(
+            file_text,
+            categorize_request.file_name,
+            categorize_request.candidate_data
+        )
+
+        return {
+            "success": True,
+            "category": result.get("category"),
+            "confidence": result.get("confidence", 0.0),
+            "identity_fields": result.get("identity_fields", {})
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Categorization error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/parse", response_model=ParseResponse)
 async def parse_cv(
     request: Request,
@@ -194,27 +337,27 @@ async def parse_cv(
     x_hmac_signature: str = Header(None)
 ):
     """Parse CV with HMAC authentication"""
-    
+
     # Verify HMAC signature
     if not x_hmac_signature:
         raise HTTPException(status_code=401, detail="Missing HMAC signature")
-    
+
     body = await request.body()
     if not verify_hmac(x_hmac_signature, body):
         raise HTTPException(status_code=401, detail="Invalid HMAC signature")
-    
+
     try:
         # Parse the CV
         parsed_data = await parse_cv_with_openai(
             parse_request.file_content,
             parse_request.file_name
         )
-        
+
         return ParseResponse(
             success=True,
             data=parsed_data
         )
-    
+
     except Exception as e:
         logger.error(f"Parse error: {e}")
         return ParseResponse(
@@ -228,33 +371,34 @@ async def parse_cv_from_url(
     x_signature: str = Header(None)
 ):
     """Parse CV from URL - backend worker endpoint"""
-    
+
     # Verify HMAC signature
     if not x_signature:
         raise HTTPException(status_code=401, detail="Missing HMAC signature")
-    
+
     body = await request.body()
     if not verify_hmac(x_signature, body):
         raise HTTPException(status_code=401, detail="Invalid HMAC signature")
-    
+
     try:
         # Parse request body
         payload = json.loads(body)
         file_url = payload.get('file_url')
         attachment_id = payload.get('attachment_id')
         file_hash = payload.get('file_hash')
-        
+
         if not file_url:
             raise HTTPException(status_code=400, detail="file_url is required")
-        
+
         # Fetch file from URL
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(file_url)
             response.raise_for_status()
             file_content = response.content
-        
+
         # Extract text from PDF
         text_content = extract_text_from_pdf(file_content)
+<<<<<<< HEAD
         
         # Extract profile photo (non-blocking - won't fail if extraction fails)
         profile_photo_url = extract_profile_photo_from_pdf(file_content, attachment_id or "unknown")
@@ -266,6 +410,12 @@ async def parse_cv_from_url(
         if profile_photo_url:
             parsed_data['profile_photo_url'] = profile_photo_url
         
+=======
+
+        # Parse with OpenAI
+        parsed_data = await parse_cv_with_openai(text_content, attachment_id or "unknown")
+
+>>>>>>> 81bec3ecd8362c205161435a2e2ff581a22cd6a8
         # Return in expected format
         return {
             "schema_version": "v1",
@@ -274,7 +424,7 @@ async def parse_cv_from_url(
             "extracted_at": datetime.utcnow().isoformat(),
             "candidate": parsed_data
         }
-    
+
     except httpx.HTTPError as e:
         logger.error(f"Failed to fetch file: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch file: {str(e)}")
@@ -287,11 +437,11 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
     try:
         pdf_file = io.BytesIO(pdf_content)
         pdf_reader = PyPDF2.PdfReader(pdf_file)
-        
+
         text_parts = []
         for page in pdf_reader.pages:
             text_parts.append(page.extract_text())
-        
+
         full_text = "\n".join(text_parts)
         logger.info(f"Extracted {len(full_text)} characters from PDF")
         return full_text
