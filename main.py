@@ -784,11 +784,11 @@ The document content is provided above - extract the information even if the for
         response = openai.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a document classification expert. Return ONLY valid JSON."},
+                {"role": "system", "content": "You are a document classification and identity extraction expert. Carefully read the document content and extract ALL identity fields. Return ONLY valid JSON."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1,
-            max_tokens=500
+            max_tokens=1000  # Increased to ensure all fields are extracted
         )
         
         result_text = response.choices[0].message.content.strip()
