@@ -658,7 +658,7 @@ def upload_photo_to_supabase(image_bytes: bytes, attachment_id: str, file_ext: s
         logger.error(f"[PhotoUpload] Traceback: {traceback.format_exc()}")
         return None
 
-async def categorize_document_with_ai(file_content: str, file_name: str, mime_type: str) -> dict:
+async def categorize_document_with_ai_text(text_content: str, file_name: str, mime_type: str) -> dict:
     """
     Use OpenAI to categorize document and extract identity fields.
     
@@ -697,18 +697,21 @@ async def categorize_document_with_ai(file_content: str, file_name: str, mime_ty
             logger.error(f"[DocumentCategorization] Base64 decode error: {decode_error}, content length: {len(file_content) if file_content else 0}, first 50 chars: {file_content[:50] if file_content else 'None'}")
             raise HTTPException(status_code=400, detail=f"Invalid base64-encoded file content: {str(decode_error)}")
         
-        # Extract text from document
-        text_content = ""
+        # Use OpenAI Vision API to read document directly (much more reliable than text extraction)
+        # Convert PDF to images and send to Vision API
         if mime_type == "application/pdf":
-            text_content = extract_text_from_pdf(file_bytes)
+            logger.info(f"[DocumentCategorization] Using OpenAI Vision API to read PDF directly: {file_name}")
+            result = await categorize_document_with_vision_api(file_bytes, file_name)
+            return result
         else:
-            # For non-PDF files, try to decode as text
+            # For non-PDF files, extract text first
+            text_content = ""
             try:
                 text_content = file_bytes.decode('utf-8', errors='ignore')
             except:
                 text_content = str(file_bytes)
-        
-        logger.info(f"[DocumentCategorization] Extracted {len(text_content)} characters from {file_name}")
+            
+            logger.info(f"[DocumentCategorization] Extracted {len(text_content)} characters from {file_name}")
         
         # Prepare OpenAI prompt for document categorization
         prompt = f"""
@@ -902,8 +905,8 @@ async def categorize_document(
             # Log validated base64 before passing to categorize function
             logger.info(f"[CategorizeDocument] Validated base64 - length: {len(file_content)}, first 50 chars: {file_content[:50]}")
         
-        # Categorize document
-        result = await categorize_document_with_ai(file_content, file_name, mime_type)
+        # Categorize document using text extraction
+        result = await categorize_document_with_ai_text(file_text, file_name, mime_type)
         # Ensure all required fields are present, even if null
         return {
             "success": True,
