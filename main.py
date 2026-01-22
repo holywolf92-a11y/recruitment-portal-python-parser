@@ -342,25 +342,38 @@ async def categorize_document(
 
     try:
         # Decode base64 file content
-        try:
-            file_bytes = base64.b64decode(categorize_request.file_content)
-            file_text = file_bytes.decode('utf-8', errors='ignore')
-        except Exception as e:
-            logger.warning(f"Failed to decode as text, trying PDF extraction: {e}")
-            # If not text, try PDF extraction
+        file_bytes = base64.b64decode(categorize_request.file_content)
+        
+        # Use OpenAI Vision API to read documents directly (much more reliable than text extraction)
+        # Vision API accepts: PNG, JPEG, GIF, WebP (NOT PDFs directly)
+        # So we need to:
+        # 1. For PDFs: Convert pages to images, then send images
+        # 2. For images: Send directly (just encode as base64)
+        # 3. For text files: Extract text and send to text-based API
+        
+        mime_type = categorize_request.mime_type or "application/pdf"
+        
+        if mime_type == "application/pdf":
+            # PDF: Convert pages to images, then send to Vision API
+            logger.info(f"[DocumentCategorization] PDF detected - converting to images for Vision API: {categorize_request.file_name}")
+            result = await categorize_document_with_vision_api(file_bytes, categorize_request.file_name, is_pdf=True)
+        elif mime_type in ["image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"]:
+            # Image: Send directly to Vision API (just encode as base64)
+            logger.info(f"[DocumentCategorization] Image detected - sending directly to Vision API: {categorize_request.file_name}")
+            result = await categorize_document_with_vision_api(file_bytes, categorize_request.file_name, is_pdf=False)
+        else:
+            # Text files: Extract text and use text-based API
             try:
-                file_bytes = base64.b64decode(categorize_request.file_content)
-                file_text = extract_text_from_pdf(file_bytes)
-            except Exception as pdf_error:
-                logger.error(f"Failed to extract text from file: {pdf_error}")
-                raise HTTPException(status_code=400, detail=f"Could not extract text from file: {str(pdf_error)}")
-
-        # Categorize the document
-        result = await categorize_document_with_ai(
-            file_text,
-            categorize_request.file_name,
-            categorize_request.candidate_data
-        )
+                file_text = file_bytes.decode('utf-8', errors='ignore')
+            except:
+                file_text = str(file_bytes)
+            
+            logger.info(f"[DocumentCategorization] Text file - extracted {len(file_text)} characters from {categorize_request.file_name}")
+            result = await categorize_document_with_ai_text(file_text, categorize_request.file_name, mime_type)
+        
+        # Map extracted_identity to identity_fields for backward compatibility
+        if result.get('extracted_identity'):
+            result['identity_fields'] = result['extracted_identity']
         # Always return required fields, even if missing
         return {
             "success": True,
