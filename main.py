@@ -220,13 +220,18 @@ Return ONLY valid JSON with these exact fields (use null for missing data):
   "email": "string or null",
   "phone": "string or null",
   "location": "string or null",
-  "nationality": "string or null (country of origin/citizenship)",
+  "nationality": "string or null (country of origin/citizenship - look for 'Nationality:', 'Country:', or in personal info section)",
   "position": "string or null (desired job position/profession/title)",
   "experience_years": "number or null (total years of professional work experience)",
   "country_of_interest": "string or null (country they want to work in, check objective/career goals)",
   "linkedin_url": "string or null",
   "summary": "string or null",
   "professional_summary": "string or null (2-3 sentence career summary)",
+  "father_name": "string or null (look for 'Father Name:', 'Father's Name:', 'Father:', or in personal information section)",
+  "cnic": "string or null (Pakistani CNIC number, format: 12345-1234567-1 or 13 digits)",
+  "passport": "string or null (passport number, look for 'Passport:', 'Passport No:', 'Passport Number:')",
+  "date_of_birth": "string or null (date of birth, look for 'DOB:', 'Date of Birth:', 'Birth Date:', format: DD-MM-YYYY or YYYY-MM-DD)",
+  "marital_status": "string or null (look for 'Marital Status:', 'Status:', 'Married', 'Single', etc.)",
   "skills": ["array of strings - all technical and professional skills"],
   "experience": [
     {{
@@ -253,13 +258,19 @@ Return ONLY valid JSON with these exact fields (use null for missing data):
 }}
 
 IMPORTANT Guidelines:
-- Extract nationality from personal info, birthplace, or passport details
+- Extract nationality from personal info section, look for "Nationality:", "Country:", or in passport details
+- Extract father_name from personal information section, look for "Father Name:", "Father's Name:", "Father:"
+- Extract CNIC from personal information, look for "CNIC:", "CNIC #:", "ID Card:", format is usually 12345-1234567-1
+- Extract passport number from personal information, look for "Passport:", "Passport No:", "Passport Number:"
+- Extract date_of_birth from personal information, look for "DOB:", "Date of Birth:", "Birth Date:", "D.O.B:"
+- Extract marital_status from personal information, look for "Marital Status:", "Status:", or keywords like "Married", "Single", "Divorced"
 - Extract position from objective, desired role, or most recent job title
 - Calculate experience_years from work history timeline if not stated
 - Look for country_of_interest in objective/goal statements (e.g., "seeking opportunities in UAE")
 - Extract ALL skills mentioned (technical, soft skills, software, languages, certifications)
 - For skills, include programming languages, tools, frameworks, soft skills
 - Be thorough in skills extraction - don't miss any mentioned abilities
+- Pay special attention to the "PERSONAL INFORMATION" or "Personal Details" section for identity fields
 
 CV Content:
 {content[:4000]}
