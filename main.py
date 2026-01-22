@@ -485,47 +485,81 @@ async def parse_cv_from_url(
         logger.error(f"Parse error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-async def categorize_document_with_vision_api(pdf_content: bytes, file_name: str) -> dict:
+async def categorize_document_with_vision_api(file_content: bytes, file_name: str, is_pdf: bool = True) -> dict:
     """
-    Use OpenAI Vision API to read PDF directly - much more reliable than text extraction!
-    Converts PDF pages to images and sends to GPT-4 Vision.
+    Use OpenAI Vision API to read documents directly - much more reliable than text extraction!
+    
+    IMPORTANT: OpenAI Vision API only accepts image formats (PNG, JPEG, GIF, WebP) - NOT PDFs!
+    That's why we need to:
+    - For PDFs: Convert pages to images first (using PyMuPDF)
+    - For images: Just encode as base64 and send directly
+    
+    Args:
+        file_content: PDF bytes or image bytes
+        file_name: Original filename
+        is_pdf: True if PDF, False if already an image
     """
     try:
-        import fitz  # PyMuPDF
-        from PIL import Image
-        import io
         import base64
-        
-        # Convert PDF pages to images
-        pdf_doc = fitz.open(stream=pdf_content, filetype="pdf")
         images = []
         
-        for page_num in range(len(pdf_doc)):
-            page = pdf_doc[page_num]
-            # Render page to image (2x zoom = ~144 DPI for good quality)
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            img_data = pix.tobytes("png")
-            img = Image.open(io.BytesIO(img_data))
+        if is_pdf:
+            # PDF: Convert pages to images (REQUIRED - Vision API doesn't accept PDFs)
+            import fitz  # PyMuPDF
+            from PIL import Image
+            import io
             
-            # Convert to base64 for OpenAI Vision API
-            buffered = io.BytesIO()
-            img.save(buffered, format="PNG")
-            img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+            pdf_doc = fitz.open(stream=file_content, filetype="pdf")
+            
+            for page_num in range(len(pdf_doc)):
+                page = pdf_doc[page_num]
+                # Render page to image (2x zoom = ~144 DPI for good quality)
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                img_data = pix.tobytes("png")
+                img = Image.open(io.BytesIO(img_data))
+                
+                # Convert to base64 for OpenAI Vision API
+                buffered = io.BytesIO()
+                img.save(buffered, format="PNG")
+                img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+                images.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{img_base64}"
+                    }
+                })
+                
+                logger.info(f"[VisionAPI] Converted PDF page {page_num + 1} to image ({len(img_base64)} chars base64)")
+            
+            pdf_doc.close()
+            
+            if not images:
+                raise Exception("No pages found in PDF")
+            
+            logger.info(f"[VisionAPI] Converted {len(images)} PDF page(s) to images")
+        else:
+            # Image: Send directly (just encode as base64 - no conversion needed!)
+            img_base64 = base64.b64encode(file_content).decode('utf-8')
+            
+            # Determine image format from filename or content
+            image_format = "png"
+            if file_name.lower().endswith(('.jpg', '.jpeg')):
+                image_format = "jpeg"
+            elif file_name.lower().endswith('.gif'):
+                image_format = "gif"
+            elif file_name.lower().endswith('.webp'):
+                image_format = "webp"
+            
             images.append({
                 "type": "image_url",
                 "image_url": {
-                    "url": f"data:image/png;base64,{img_base64}"
+                    "url": f"data:image/{image_format};base64,{img_base64}"
                 }
             })
             
-            logger.info(f"[VisionAPI] Converted page {page_num + 1} to image ({len(img_base64)} chars base64)")
+            logger.info(f"[VisionAPI] Encoded image directly as base64 ({len(img_base64)} chars, format: {image_format})")
         
-        pdf_doc.close()
-        
-        if not images:
-            raise Exception("No pages found in PDF")
-        
-        logger.info(f"[VisionAPI] Converted {len(images)} page(s) to images, sending to OpenAI Vision API")
+        logger.info(f"[VisionAPI] Sending {len(images)} image(s) to OpenAI Vision API")
         
         # Prepare prompt for Vision API
         prompt = """You are a document classification and identity extraction AI. Analyze the document image(s) and provide:
@@ -874,21 +908,32 @@ async def categorize_document_with_ai_text(text_content: str, file_name: str, mi
             logger.error(f"[DocumentCategorization] Base64 decode error: {decode_error}, content length: {len(file_content) if file_content else 0}, first 50 chars: {file_content[:50] if file_content else 'None'}")
             raise HTTPException(status_code=400, detail=f"Invalid base64-encoded file content: {str(decode_error)}")
         
-        # Use OpenAI Vision API to read document directly (much more reliable than text extraction)
-        # Convert PDF to images and send to Vision API
+        # Use OpenAI Vision API to read documents directly (much more reliable than text extraction)
+        # Vision API accepts: PNG, JPEG, GIF, WebP (NOT PDFs directly)
+        # So we need to:
+        # 1. For PDFs: Convert pages to images, then send images
+        # 2. For images: Send directly (just encode as base64)
+        # 3. For text files: Extract text and send to text-based API
+        
         if mime_type == "application/pdf":
-            logger.info(f"[DocumentCategorization] Using OpenAI Vision API to read PDF directly: {file_name}")
-            result = await categorize_document_with_vision_api(file_bytes, file_name)
+            # PDF: Convert pages to images, then send to Vision API
+            logger.info(f"[DocumentCategorization] PDF detected - converting to images for Vision API: {file_name}")
+            result = await categorize_document_with_vision_api(file_bytes, file_name, is_pdf=True)
+            return result
+        elif mime_type in ["image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"]:
+            # Image: Send directly to Vision API (just encode as base64)
+            logger.info(f"[DocumentCategorization] Image detected - sending directly to Vision API: {file_name}")
+            result = await categorize_document_with_vision_api(file_bytes, file_name, is_pdf=False)
             return result
         else:
-            # For non-PDF files, extract text first
+            # Text files: Extract text and use text-based API
             text_content = ""
             try:
                 text_content = file_bytes.decode('utf-8', errors='ignore')
             except:
                 text_content = str(file_bytes)
             
-            logger.info(f"[DocumentCategorization] Extracted {len(text_content)} characters from {file_name}")
+            logger.info(f"[DocumentCategorization] Text file - extracted {len(text_content)} characters from {file_name}")
         
         # Prepare OpenAI prompt for document categorization
         prompt = f"""
