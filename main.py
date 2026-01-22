@@ -486,9 +486,40 @@ async def parse_cv_from_url(
         raise HTTPException(status_code=500, detail=str(e))
 
 def extract_text_from_pdf(pdf_content: bytes) -> str:
-    """Extract text from PDF bytes using PyPDF2, with PyMuPDF fallback for better extraction"""
+    """Extract text from PDF bytes using PyMuPDF (fitz) first, with PyPDF2 fallback"""
     try:
-        # Try PyPDF2 first
+        # Try PyMuPDF FIRST - it's much better at text extraction
+        try:
+            import fitz  # PyMuPDF
+            pdf_doc = fitz.open(stream=pdf_content, filetype="pdf")
+            pymupdf_text_parts = []
+            for i, page in enumerate(pdf_doc):
+                page_text = page.get_text()
+                pymupdf_text_parts.append(page_text)
+                logger.info(f"[PDFExtraction] PyMuPDF - Page {i+1}: Extracted {len(page_text)} characters")
+            
+            pymupdf_text = "\n".join(pymupdf_text_parts)
+            logger.info(f"[PDFExtraction] PyMuPDF - Total extracted {len(pymupdf_text)} characters from {len(pdf_doc)} page(s)")
+            
+            # Log full text preview for debugging
+            if pymupdf_text:
+                preview = pymupdf_text[:1000].replace('\n', ' | ').replace('\r', ' ')
+                logger.info(f"[PDFExtraction] PyMuPDF Text preview (first 1000 chars): {preview}")
+            
+            pdf_doc.close()
+            
+            # If PyMuPDF extracted good text, use it
+            if len(pymupdf_text) > 100:
+                logger.info(f"[PDFExtraction] Using PyMuPDF result ({len(pymupdf_text)} chars)")
+                return pymupdf_text
+            else:
+                logger.warning(f"[PDFExtraction] PyMuPDF extracted only {len(pymupdf_text)} characters. Trying PyPDF2 as fallback...")
+        except ImportError:
+            logger.warning(f"[PDFExtraction] PyMuPDF (fitz) not available. Using PyPDF2.")
+        except Exception as pymupdf_error:
+            logger.warning(f"[PDFExtraction] PyMuPDF extraction failed: {pymupdf_error}. Trying PyPDF2 as fallback...")
+        
+        # Fallback to PyPDF2
         pdf_file = io.BytesIO(pdf_content)
         pdf_reader = PyPDF2.PdfReader(pdf_file)
 
@@ -501,38 +532,10 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
         full_text = "\n".join(text_parts)
         logger.info(f"[PDFExtraction] PyPDF2 - Total extracted {len(full_text)} characters from {len(pdf_reader.pages)} page(s)")
         
-        # If PyPDF2 extracted very little text (< 1000 chars), try PyMuPDF as fallback
-        if len(full_text) < 1000:
-            logger.warning(f"[PDFExtraction] PyPDF2 extracted only {len(full_text)} characters. Trying PyMuPDF (fitz) for better extraction...")
-            try:
-                import fitz  # PyMuPDF
-                pdf_doc = fitz.open(stream=pdf_content, filetype="pdf")
-                pymupdf_text_parts = []
-                for i, page in enumerate(pdf_doc):
-                    page_text = page.get_text()
-                    pymupdf_text_parts.append(page_text)
-                    logger.info(f"[PDFExtraction] PyMuPDF - Page {i+1}: Extracted {len(page_text)} characters")
-                
-                pymupdf_text = "\n".join(pymupdf_text_parts)
-                logger.info(f"[PDFExtraction] PyMuPDF - Total extracted {len(pymupdf_text)} characters from {len(pdf_doc)} page(s)")
-                
-                # Use PyMuPDF result if it extracted significantly more text
-                if len(pymupdf_text) > len(full_text) * 1.5:  # At least 50% more
-                    logger.info(f"[PDFExtraction] Using PyMuPDF result ({len(pymupdf_text)} chars) over PyPDF2 ({len(full_text)} chars)")
-                    full_text = pymupdf_text
-                else:
-                    logger.info(f"[PDFExtraction] PyMuPDF didn't extract significantly more text. Using PyPDF2 result.")
-                
-                pdf_doc.close()
-            except ImportError:
-                logger.warning(f"[PDFExtraction] PyMuPDF (fitz) not available. Using PyPDF2 result.")
-            except Exception as pymupdf_error:
-                logger.warning(f"[PDFExtraction] PyMuPDF extraction failed: {pymupdf_error}. Using PyPDF2 result.")
-        
-        # Log a preview of extracted text (first 500 chars) for debugging
+        # Log full text preview for debugging
         if full_text:
-            preview = full_text[:500].replace('\n', ' ').replace('\r', ' ')
-            logger.info(f"[PDFExtraction] Text preview (first 500 chars): {preview}")
+            preview = full_text[:1000].replace('\n', ' | ').replace('\r', ' ')
+            logger.info(f"[PDFExtraction] PyPDF2 Text preview (first 1000 chars): {preview}")
         else:
             logger.warning(f"[PDFExtraction] WARNING: No text extracted from PDF! PDF might be image-based or corrupted.")
         
@@ -760,8 +763,19 @@ Return ONLY valid JSON with this exact structure:
 }}
 
 Document filename: {file_name}
-Document content:
-{text_content[:3000]}
+Document content (full text extracted from PDF):
+{text_content}
+
+IMPORTANT: Extract ALL identity fields from the document content above. Look for:
+- Full Name / Name
+- Passport Number / Passport No
+- Nationality / Country
+- Date of Birth / DOB
+- Issue Date
+- Expiry Date / Expiry
+- Place of Issue
+
+The document content is provided above - extract the information even if the format is slightly different.
 """
 
         # Call OpenAI
