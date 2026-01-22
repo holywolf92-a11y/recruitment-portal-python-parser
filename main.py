@@ -92,12 +92,18 @@ CATEGORIES (choose ONE):
 
 IDENTITY FIELDS TO EXTRACT (return null if not found):
 - name: Full name of the person
+- father_name: Father's name (if available)
 - cnic: Pakistani CNIC (format: 12345-1234567-1)
-- passport_no: Passport number
+- passport_no: Passport number (e.g., PA1234567, AB1234567)
 - email: Email address
 - phone: Phone number
-- dob: Date of birth
+- date_of_birth: Date of birth (format: DD-MM-YYYY or YYYY-MM-DD)
 - document_number: Any other ID number found
+- nationality: Nationality (e.g., Pakistani, Indian, etc.)
+- passport_expiry: Passport expiry date (format: DD-MM-YYYY or YYYY-MM-DD)
+- expiry_date: Alternative field for passport expiry date
+- issue_date: Passport issue date (format: DD-MM-YYYY or YYYY-MM-DD)
+- place_of_issue: Place where passport was issued (e.g., Islamabad, Karachi)
 
 Document Content:
 {content[:4000]}
@@ -111,12 +117,19 @@ Return ONLY valid JSON:
   "confidence": 0.0_to_1.0,
   "identity_fields": {{
     "name": "string or null",
+    "father_name": "string or null",
     "cnic": "string or null",
     "passport_no": "string or null",
     "email": "string or null",
     "phone": "string or null",
-    "dob": "string or null",
-    "document_number": "string or null"
+    "date_of_birth": "string or null (format: DD-MM-YYYY or YYYY-MM-DD)",
+    "dob": "string or null (same as date_of_birth, for backward compatibility)",
+    "document_number": "string or null",
+    "nationality": "string or null (e.g., Pakistani, Indian)",
+    "passport_expiry": "string or null (format: DD-MM-YYYY or YYYY-MM-DD)",
+    "expiry_date": "string or null (alternative field for passport expiry)",
+    "issue_date": "string or null (format: DD-MM-YYYY or YYYY-MM-DD)",
+    "place_of_issue": "string or null (e.g., Islamabad, Karachi)"
   }}
 }}
 """
@@ -143,9 +156,45 @@ Return ONLY valid JSON:
 
         result_text = result_text.strip()
         parsed_data = json.loads(result_text)
-
-        logger.info(f"Categorized document: {filename} as {parsed_data.get('category')} with confidence {parsed_data.get('confidence')}")
-        return parsed_data
+        # Ensure required fields are present and correct type
+        category = parsed_data.get('category') or 'other_documents'
+        confidence = parsed_data.get('confidence')
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        identity_fields = parsed_data.get('identity_fields')
+        if not isinstance(identity_fields, dict):
+            identity_fields = {
+                "name": None,
+                "father_name": None,
+                "cnic": None,
+                "passport_no": None,
+                "email": None,
+                "phone": None,
+                "date_of_birth": None,
+                "dob": None,
+                "document_number": None,
+                "nationality": None,
+                "passport_expiry": None,
+                "expiry_date": None,
+                "issue_date": None,
+                "place_of_issue": None
+            }
+        
+        # Ensure backward compatibility: if dob exists but date_of_birth doesn't, copy it
+        if identity_fields.get("dob") and not identity_fields.get("date_of_birth"):
+            identity_fields["date_of_birth"] = identity_fields["dob"]
+        
+        # Ensure passport_expiry or expiry_date is set (prefer passport_expiry)
+        if identity_fields.get("expiry_date") and not identity_fields.get("passport_expiry"):
+            identity_fields["passport_expiry"] = identity_fields["expiry_date"]
+        logger.info(f"Categorized document: {filename} as {category} with confidence {confidence}")
+        return {
+            "category": category,
+            "confidence": confidence,
+            "identity_fields": identity_fields
+        }
 
     except json.JSONDecodeError as e:
         logger.error(f"JSON decode error: {e}, response: {result_text}")
@@ -287,12 +336,27 @@ async def categorize_document(
             categorize_request.file_name,
             categorize_request.candidate_data
         )
-
+        # Always return required fields, even if missing
         return {
             "success": True,
-            "category": result.get("category"),
-            "confidence": result.get("confidence", 0.0),
-            "identity_fields": result.get("identity_fields", {})
+            "category": result.get("category", "other_documents"),
+            "confidence": float(result.get("confidence", 0.0)),
+            "identity_fields": result.get("identity_fields") or {
+                "name": None,
+                "father_name": None,
+                "cnic": None,
+                "passport_no": None,
+                "email": None,
+                "phone": None,
+                "date_of_birth": None,
+                "dob": None,
+                "document_number": None,
+                "nationality": None,
+                "passport_expiry": None,
+                "expiry_date": None,
+                "issue_date": None,
+                "place_of_issue": None
+            }
         }
 
     except HTTPException:
