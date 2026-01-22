@@ -725,20 +725,22 @@ You are a document classification and identity extraction AI. Analyze the follow
 
 2. Confidence score (0.0 to 1.0) for the category classification
 
-3. Extract identity fields from the document:
-   - name: Full name of the person
+3. Extract identity fields from the document. READ THE DOCUMENT CONTENT CAREFULLY and extract:
+   - name: Full name of the person (look for "Full Name:", "Name:", "Full Name", etc.)
    - father_name: Father's name (common in Pakistani documents)
    - cnic: Pakistani CNIC number (format: 12345-1234567-1 or 13 digits)
-   - passport_no: Passport number (e.g., PA1234567, AB1234567)
+   - passport_no: Passport number (look for "Passport No:", "Passport Number:", "Passport No", etc. - e.g., PA1234567, AB1234567)
    - email: Email address
    - phone: Phone number
-   - date_of_birth: Date of birth (format: DD-MM-YYYY or YYYY-MM-DD)
+   - date_of_birth: Date of birth (look for "Date of Birth:", "DOB:", "Date of Birth", etc. - format: DD-MM-YYYY or YYYY-MM-DD)
    - document_number: Any other ID number found in the document
-   - nationality: Nationality (e.g., Pakistani, Indian, etc.)
-   - passport_expiry: Passport expiry date (format: DD-MM-YYYY or YYYY-MM-DD)
+   - nationality: Nationality (look for "Nationality:", "Country:", "Nationality", etc. - e.g., Pakistani, Indian, etc.)
+   - passport_expiry: Passport expiry date (look for "Expiry Date:", "Expiry:", "Expiry Date", etc. - format: DD-MM-YYYY or YYYY-MM-DD)
    - expiry_date: Alternative field for passport expiry date
-   - issue_date: Passport issue date (format: DD-MM-YYYY or YYYY-MM-DD)
-   - place_of_issue: Place where passport was issued (e.g., Islamabad, Karachi)
+   - issue_date: Passport issue date (look for "Issue Date:", "Issue Date", etc. - format: DD-MM-YYYY or YYYY-MM-DD)
+   - place_of_issue: Place where passport was issued (look for "Place of Issue:", "Place of Issue", etc. - e.g., Islamabad, Karachi)
+   
+   IMPORTANT: The document content is provided below. Extract the information even if labels are slightly different (e.g., "Full Name" vs "Name", "Passport No" vs "Passport Number").
 
 Return ONLY valid JSON with this exact structure:
 {{
