@@ -687,11 +687,16 @@ You are a document classification and identity extraction AI. Analyze the follow
    - name: Full name of the person
    - father_name: Father's name (common in Pakistani documents)
    - cnic: Pakistani CNIC number (format: 12345-1234567-1 or 13 digits)
-   - passport_no: Passport number
+   - passport_no: Passport number (e.g., PA1234567, AB1234567)
    - email: Email address
    - phone: Phone number
-   - date_of_birth: Date of birth (any format)
+   - date_of_birth: Date of birth (format: DD-MM-YYYY or YYYY-MM-DD)
    - document_number: Any other ID number found in the document
+   - nationality: Nationality (e.g., Pakistani, Indian, etc.)
+   - passport_expiry: Passport expiry date (format: DD-MM-YYYY or YYYY-MM-DD)
+   - expiry_date: Alternative field for passport expiry date
+   - issue_date: Passport issue date (format: DD-MM-YYYY or YYYY-MM-DD)
+   - place_of_issue: Place where passport was issued (e.g., Islamabad, Karachi)
 
 Return ONLY valid JSON with this exact structure:
 {{
@@ -706,7 +711,12 @@ Return ONLY valid JSON with this exact structure:
     "email": "string or null",
     "phone": "string or null",
     "date_of_birth": "string or null",
-    "document_number": "string or null"
+    "document_number": "string or null",
+    "nationality": "string or null (e.g., Pakistani, Indian)",
+    "passport_expiry": "string or null (format: DD-MM-YYYY or YYYY-MM-DD)",
+    "expiry_date": "string or null (alternative field for passport expiry)",
+    "issue_date": "string or null (format: DD-MM-YYYY or YYYY-MM-DD)",
+    "place_of_issue": "string or null (e.g., Islamabad, Karachi)"
   }}
 }}
 
@@ -741,6 +751,21 @@ Document content:
         
         # Ensure extracted_identity exists and filter out null values for logging
         extracted_identity = parsed_result.get('extracted_identity', {})
+        
+        # Ensure all passport fields are present (even if null)
+        if not extracted_identity:
+            extracted_identity = {}
+        
+        # Ensure backward compatibility: if dob exists but date_of_birth doesn't, copy it
+        if extracted_identity.get("dob") and not extracted_identity.get("date_of_birth"):
+            extracted_identity["date_of_birth"] = extracted_identity["dob"]
+        
+        # Ensure passport_expiry or expiry_date is set (prefer passport_expiry)
+        if extracted_identity.get("expiry_date") and not extracted_identity.get("passport_expiry"):
+            extracted_identity["passport_expiry"] = extracted_identity["expiry_date"]
+        
+        parsed_result['extracted_identity'] = extracted_identity
+        
         non_null_identity = {k: v for k, v in extracted_identity.items() if v is not None} if extracted_identity else {}
         
         logger.info(f"[DocumentCategorization] Categorized as: {parsed_result.get('category')} (confidence: {parsed_result.get('confidence')})")
