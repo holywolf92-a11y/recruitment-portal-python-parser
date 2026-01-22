@@ -1174,8 +1174,37 @@ async def categorize_document(
             # Log validated base64 before passing to categorize function
             logger.info(f"[CategorizeDocument] Validated base64 - length: {len(file_content)}, first 50 chars: {file_content[:50]}")
         
-        # Categorize document using text extraction
-        result = await categorize_document_with_ai_text(file_text, file_name, mime_type)
+        # Decode base64 to bytes
+        try:
+            file_bytes = base64.b64decode(file_content, validate=False)
+        except Exception as decode_error:
+            logger.error(f"[CategorizeDocument] Base64 decode error: {decode_error}")
+            raise HTTPException(status_code=400, detail=f"Invalid base64-encoded file content: {str(decode_error)}")
+        
+        # Use OpenAI Vision API to read documents directly (much more reliable than text extraction)
+        # Vision API accepts: PNG, JPEG, GIF, WebP (NOT PDFs directly)
+        # So we need to:
+        # 1. For PDFs: Convert pages to images, then send images
+        # 2. For images: Send directly (just encode as base64)
+        # 3. For text files: Extract text and send to text-based API
+        
+        if mime_type == "application/pdf":
+            # PDF: Convert pages to images, then send to Vision API
+            logger.info(f"[CategorizeDocument] PDF detected - converting to images for Vision API: {file_name}")
+            result = await categorize_document_with_vision_api(file_bytes, file_name, is_pdf=True)
+        elif mime_type in ["image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"]:
+            # Image: Send directly to Vision API (just encode as base64)
+            logger.info(f"[CategorizeDocument] Image detected - sending directly to Vision API: {file_name}")
+            result = await categorize_document_with_vision_api(file_bytes, file_name, is_pdf=False)
+        else:
+            # Text files: Extract text and use text-based API
+            try:
+                file_text = file_bytes.decode('utf-8', errors='ignore')
+            except:
+                file_text = str(file_bytes)
+            
+            logger.info(f"[CategorizeDocument] Text file - extracted {len(file_text)} characters from {file_name}")
+            result = await categorize_document_with_ai_text(file_text, file_name, mime_type)
         # Ensure all required fields are present, even if null
         return {
             "success": True,
