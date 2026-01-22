@@ -485,6 +485,183 @@ async def parse_cv_from_url(
         logger.error(f"Parse error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+async def categorize_document_with_vision_api(pdf_content: bytes, file_name: str) -> dict:
+    """
+    Use OpenAI Vision API to read PDF directly - much more reliable than text extraction!
+    Converts PDF pages to images and sends to GPT-4 Vision.
+    """
+    try:
+        import fitz  # PyMuPDF
+        from PIL import Image
+        import io
+        import base64
+        
+        # Convert PDF pages to images
+        pdf_doc = fitz.open(stream=pdf_content, filetype="pdf")
+        images = []
+        
+        for page_num in range(len(pdf_doc)):
+            page = pdf_doc[page_num]
+            # Render page to image (2x zoom = ~144 DPI for good quality)
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            img_data = pix.tobytes("png")
+            img = Image.open(io.BytesIO(img_data))
+            
+            # Convert to base64 for OpenAI Vision API
+            buffered = io.BytesIO()
+            img.save(buffered, format="PNG")
+            img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+            images.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{img_base64}"
+                }
+            })
+            
+            logger.info(f"[VisionAPI] Converted page {page_num + 1} to image ({len(img_base64)} chars base64)")
+        
+        pdf_doc.close()
+        
+        if not images:
+            raise Exception("No pages found in PDF")
+        
+        logger.info(f"[VisionAPI] Converted {len(images)} page(s) to images, sending to OpenAI Vision API")
+        
+        # Prepare prompt for Vision API
+        prompt = """You are a document classification and identity extraction AI. Analyze the document image(s) and provide:
+
+1. Document category (choose ONE):
+   - cv_resume: CV, resume, curriculum vitae
+   - passport: Passport copy, passport scan
+   - certificates: Educational certificates, degrees, diplomas, training certificates
+   - contracts: Employment contracts, offer letters, agreements
+   - medical_reports: Medical test reports, health certificates, fitness certificates
+   - photos: Passport photos, ID photos
+   - other_documents: Any other document type
+
+2. Confidence score (0.0 to 1.0) for the category classification
+
+3. Extract ALL identity fields from the document. READ THE DOCUMENT CAREFULLY and extract:
+   - name: Full name of the person (look for "Full Name:", "Name:", "Full Name", etc.)
+   - father_name: Father's name (common in Pakistani documents)
+   - cnic: Pakistani CNIC number (format: 12345-1234567-1 or 13 digits)
+   - passport_no: Passport number (look for "Passport No:", "Passport Number:", "Passport No", etc. - e.g., PA1234567, AB1234567)
+   - email: Email address
+   - phone: Phone number
+   - date_of_birth: Date of birth (look for "Date of Birth:", "DOB:", "Date of Birth", etc. - format: DD-MM-YYYY or YYYY-MM-DD)
+   - document_number: Any other ID number found in the document
+   - nationality: Nationality (look for "Nationality:", "Country:", "Nationality", etc. - e.g., Pakistani, Indian, etc.)
+   - passport_expiry: Passport expiry date (look for "Expiry Date:", "Expiry:", "Expiry Date", etc. - format: DD-MM-YYYY or YYYY-MM-DD)
+   - expiry_date: Alternative field for passport expiry date
+   - issue_date: Passport issue date (look for "Issue Date:", "Issue Date", etc. - format: DD-MM-YYYY or YYYY-MM-DD)
+   - place_of_issue: Place where passport was issued (look for "Place of Issue:", "Place of Issue", etc. - e.g., Islamabad, Karachi)
+
+Return ONLY valid JSON with this exact structure:
+{
+  "category": "category_name",
+  "confidence": 0.95,
+  "ocr_confidence": 0.90,
+  "extracted_identity": {
+    "name": "string or null",
+    "father_name": "string or null",
+    "cnic": "string or null",
+    "passport_no": "string or null",
+    "email": "string or null",
+    "phone": "string or null",
+    "date_of_birth": "string or null",
+    "document_number": "string or null",
+    "nationality": "string or null (e.g., Pakistani, Indian)",
+    "passport_expiry": "string or null (format: DD-MM-YYYY or YYYY-MM-DD)",
+    "expiry_date": "string or null (alternative field for passport expiry)",
+    "issue_date": "string or null (format: DD-MM-YYYY or YYYY-MM-DD)",
+    "place_of_issue": "string or null (e.g., Islamabad, Karachi)"
+  }
+}
+
+IMPORTANT: Read the document image(s) carefully and extract ALL visible information. The document may have clear text like:
+- Full Name: Muhammad Farhan
+- Passport No: PA1234567
+- Nationality: Pakistani
+- Date of Birth: 15-08-1994
+- Issue Date: 10-06-2022
+- Expiry Date: 09-06-2032
+- Place of Issue: Islamabad
+
+Extract this information even if labels are slightly different."""
+        
+        # Call OpenAI Vision API
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        
+        # Build messages with images
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    *images  # Add all page images
+                ]
+            }
+        ]
+        
+        logger.info(f"[VisionAPI] Calling OpenAI Vision API (GPT-4o) with {len(images)} image(s)")
+        
+        response = client.chat.completions.create(
+            model="gpt-4o",  # Use GPT-4o for vision (better than gpt-4o-mini for images)
+            messages=messages,
+            temperature=0.1,
+            max_tokens=2000
+        )
+        
+        result_text = response.choices[0].message.content.strip()
+        logger.info(f"[VisionAPI] Received response from OpenAI ({len(result_text)} chars)")
+        
+        # Clean up markdown code blocks if present
+        if result_text.startswith("```json"):
+            result_text = result_text[7:]
+        elif result_text.startswith("```"):
+            result_text = result_text[3:]
+        if result_text.endswith("```"):
+            result_text = result_text[:-3]
+        
+        result_text = result_text.strip()
+        parsed_result = json.loads(result_text)
+        
+        # Ensure extracted_identity exists
+        extracted_identity = parsed_result.get('extracted_identity', {})
+        if not extracted_identity:
+            extracted_identity = {}
+        
+        # Ensure backward compatibility
+        if extracted_identity.get("dob") and not extracted_identity.get("date_of_birth"):
+            extracted_identity["date_of_birth"] = extracted_identity["dob"]
+        
+        if extracted_identity.get("expiry_date") and not extracted_identity.get("passport_expiry"):
+            extracted_identity["passport_expiry"] = extracted_identity["expiry_date"]
+        
+        parsed_result['extracted_identity'] = extracted_identity
+        
+        non_null_identity = {k: v for k, v in extracted_identity.items() if v is not None} if extracted_identity else {}
+        
+        logger.info(f"[VisionAPI] Categorized as: {parsed_result.get('category')} (confidence: {parsed_result.get('confidence')})")
+        if non_null_identity:
+            logger.info(f"[VisionAPI] Extracted identity fields: {list(non_null_identity.keys())}")
+            logger.info(f"[VisionAPI] Extracted values: {non_null_identity}")
+        else:
+            logger.warning(f"[VisionAPI] No identity fields extracted from document")
+        
+        return parsed_result
+        
+    except Exception as e:
+        logger.error(f"[VisionAPI] Error: {e}")
+        import traceback
+        logger.error(f"[VisionAPI] Traceback: {traceback.format_exc()}")
+        # Fallback to text extraction if Vision API fails
+        logger.warning(f"[VisionAPI] Falling back to text extraction method")
+        text_content = extract_text_from_pdf(pdf_content)
+        # Continue with text-based categorization
+        return await categorize_document_with_ai_text(text_content, file_name, "application/pdf")
+
 def extract_text_from_pdf(pdf_content: bytes) -> str:
     """Extract text from PDF bytes using PyMuPDF (fitz) first, with PyPDF2 fallback"""
     try:
