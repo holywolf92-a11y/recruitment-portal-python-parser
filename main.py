@@ -372,14 +372,30 @@ async def categorize_document(
             result = await categorize_document_with_ai_text(file_text, categorize_request.file_name, mime_type)
         
         # Map extracted_identity to identity_fields for backward compatibility
+        # Vision API returns extracted_identity, but backend expects identity_fields
         if result.get('extracted_identity'):
-            result['identity_fields'] = result['extracted_identity']
-        # Always return required fields, even if missing
-        return {
-            "success": True,
-            "category": result.get("category", "other_documents"),
-            "confidence": float(result.get("confidence", 0.0)),
-            "identity_fields": result.get("identity_fields") or {
+            identity_fields = result['extracted_identity']
+            # Ensure all required fields are present
+            identity_fields = {
+                "name": identity_fields.get("name"),
+                "father_name": identity_fields.get("father_name"),
+                "cnic": identity_fields.get("cnic"),
+                "passport_no": identity_fields.get("passport_no"),
+                "email": identity_fields.get("email"),
+                "phone": identity_fields.get("phone"),
+                "date_of_birth": identity_fields.get("date_of_birth") or identity_fields.get("dob"),
+                "dob": identity_fields.get("dob") or identity_fields.get("date_of_birth"),
+                "document_number": identity_fields.get("document_number"),
+                "nationality": identity_fields.get("nationality"),
+                "passport_expiry": identity_fields.get("passport_expiry") or identity_fields.get("expiry_date"),
+                "expiry_date": identity_fields.get("expiry_date") or identity_fields.get("passport_expiry"),
+                "issue_date": identity_fields.get("issue_date"),
+                "place_of_issue": identity_fields.get("place_of_issue")
+            }
+            result['identity_fields'] = identity_fields
+        else:
+            # No identity fields extracted - return empty structure
+            result['identity_fields'] = {
                 "name": None,
                 "father_name": None,
                 "cnic": None,
@@ -395,6 +411,13 @@ async def categorize_document(
                 "issue_date": None,
                 "place_of_issue": None
             }
+        
+        # Always return required fields, even if missing
+        return {
+            "success": True,
+            "category": result.get("category", "other_documents"),
+            "confidence": float(result.get("confidence", 0.0)),
+            "identity_fields": result.get("identity_fields")
         }
 
     except HTTPException:
