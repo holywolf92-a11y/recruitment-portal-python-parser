@@ -492,14 +492,24 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
         pdf_reader = PyPDF2.PdfReader(pdf_file)
 
         text_parts = []
-        for page in pdf_reader.pages:
-            text_parts.append(page.extract_text())
+        for i, page in enumerate(pdf_reader.pages):
+            page_text = page.extract_text()
+            text_parts.append(page_text)
+            logger.info(f"[PDFExtraction] Page {i+1}: Extracted {len(page_text)} characters")
 
         full_text = "\n".join(text_parts)
-        logger.info(f"Extracted {len(full_text)} characters from PDF")
+        logger.info(f"[PDFExtraction] Total extracted {len(full_text)} characters from {len(pdf_reader.pages)} page(s)")
+        
+        # Log a preview of extracted text (first 500 chars) for debugging
+        if full_text:
+            preview = full_text[:500].replace('\n', ' ').replace('\r', ' ')
+            logger.info(f"[PDFExtraction] Text preview (first 500 chars): {preview}")
+        else:
+            logger.warning(f"[PDFExtraction] WARNING: No text extracted from PDF! PDF might be image-based or corrupted.")
+        
         return full_text
     except Exception as e:
-        logger.error(f"PDF extraction error: {e}")
+        logger.error(f"[PDFExtraction] PDF extraction error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to extract PDF text: {str(e)}")
 
 def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Optional[str]:
