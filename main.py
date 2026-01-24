@@ -5,9 +5,22 @@ import hmac
 import hashlib
 import os
 import logging
+
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env: parser dir first, then fallback to Recruitment Automation Portal (2) python-parser
+_env_dir = Path(__file__).resolve().parent
+_load = load_dotenv(_env_dir / ".env")
+if not _load:
+    _fallback = _env_dir.parent / "Recruitment Automation Portal (2)" / "python-parser" / ".env"
+    if _fallback.exists():
+        load_dotenv(_fallback)
 from typing import Optional, Dict, Any
 import openai
 from datetime import datetime
+
+from split_and_categorize import run_split_and_categorize
 import json
 import httpx
 import PyPDF2
@@ -59,6 +72,7 @@ class CategorizeRequest(BaseModel):
     file_name: str
     mime_type: str
     candidate_data: Optional[Dict[str, Any]] = None
+    use_textract: Optional[bool] = None  # True=use AWS Textract when configured; False=Vision-only; None=auto (use if AWS set)
 
 class ParseResponse(BaseModel):
     success: bool
@@ -436,6 +450,47 @@ async def categorize_document(
     except Exception as e:
         logger.error(f"Categorization error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/split-and-categorize")
+async def split_and_categorize(
+    request: Request,
+    categorize_request: CategorizeRequest,
+    x_hmac_signature: str = Header(None),
+):
+    """
+    Dual OCR + Vision fallback. PDF -> pages -> Engine A (Textract+Vision) or B (Vision-only).
+    Returns { success, engine_used, documents }.
+    engine_used: "vision_only" | "textract+vision". Per doc: doc_type, pages, split_strategy, confidence, identity, pdf_base64, needs_review.
+    """
+    if not x_hmac_signature:
+        raise HTTPException(status_code=401, detail="Missing HMAC signature")
+    body = await request.body()
+    if not verify_hmac(x_hmac_signature, body):
+        raise HTTPException(status_code=401, detail="Invalid HMAC signature")
+
+    try:
+        file_bytes = base64.b64decode(categorize_request.file_content)
+        mime_type = categorize_request.mime_type or "application/pdf"
+        is_pdf = mime_type == "application/pdf"
+        if not is_pdf and mime_type not in ["image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"]:
+            raise HTTPException(status_code=400, detail="Unsupported type. Use PDF or image (jpeg, png, gif, webp).")
+
+        result = await run_split_and_categorize(
+            file_content=file_bytes,
+            file_name=categorize_request.file_name,
+            is_pdf=is_pdf,
+            openai_api_key=OPENAI_API_KEY,
+            candidate_data=categorize_request.candidate_data,
+            use_textract=categorize_request.use_textract,
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[SplitAndCategorize] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/parse", response_model=ParseResponse)
 async def parse_cv(

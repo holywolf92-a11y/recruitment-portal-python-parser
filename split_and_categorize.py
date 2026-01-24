@@ -1,0 +1,540 @@
+"""
+Unified document split & classification.
+
+Dual OCR + Vision fallback:
+- Primary: AWS Textract + OpenAI Vision (layout + classify).
+- Fallback: OpenAI Vision only (layout inference + classify).
+Engine chosen automatically; processing never fails due to Textract.
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import json
+import logging
+import os
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+try:
+    from textract_layout import (
+        aws_configured,
+        detect_engine,
+        get_blocks_from_image,
+        cluster_blocks_to_regions,
+        validate_no_overlap,
+        crop_image_to_region,
+    )
+except ImportError:
+    aws_configured = lambda: False
+    detect_engine = None
+    get_blocks_from_image = None
+    cluster_blocks_to_regions = None
+    validate_no_overlap = None
+    crop_image_to_region = None
+
+CONFIDENCE_THRESHOLD = 0.88
+DOC_CATEGORIES = [
+    "cv_resume", "passport", "certificates", "contracts",
+    "medical_reports", "photos", "other_documents",
+]
+
+VISION_PROMPT = """You are a document classification and identity extraction AI. Analyze this SINGLE page image and provide:
+
+1. Document category (choose ONE):
+   - cv_resume: CV, resume, curriculum vitae
+   - passport: Passport copy, passport scan
+   - certificates: Educational certificates, degrees, diplomas, training certificates
+   - contracts: Employment contracts, offer letters, agreements
+   - medical_reports: Medical test reports, health certificates, fitness certificates
+   - photos: Passport photos, ID photos
+   - other_documents: Any other document type
+
+2. Confidence score (0.0 to 1.0) for the category classification.
+
+3. Extract ALL identity fields from the document:
+   - name, father_name, cnic, passport_no, email, phone
+   - date_of_birth, document_number, nationality
+   - passport_expiry, expiry_date, issue_date, place_of_issue
+
+Return ONLY valid JSON:
+{
+  "category": "category_name",
+  "confidence": 0.95,
+  "extracted_identity": {
+    "name": "string or null",
+    "father_name": "string or null",
+    "cnic": "string or null",
+    "passport_no": "string or null",
+    "email": "string or null",
+    "phone": "string or null",
+    "date_of_birth": "string or null",
+    "document_number": "string or null",
+    "nationality": "string or null",
+    "passport_expiry": "string or null",
+    "expiry_date": "string or null",
+    "issue_date": "string or null",
+    "place_of_issue": "string or null"
+  }
+}
+"""
+
+VISION_LAYOUT_PROMPT = """You are a document layout and classification AI. Analyze this page image.
+
+1. LAYOUT: Is this page a SINGLE document (whole page) or MULTIPLE distinct documents (e.g. passport top, medical bottom)?
+   - "single": one document fills the page
+   - "multi": 2+ clearly separate documents in bands/sections (top-half, bottom-half, etc.)
+
+2. If "single": give category, confidence, extracted_identity (same as standard classification).
+
+3. If "multi": list regions from top to bottom. Each region: top_pct (0=top of page), height_pct (fraction of page height), and optional doc_type hint.
+   Example: passport on top 50%%, medical on bottom 50%% -> regions: [{"top_pct": 0, "height_pct": 0.5, "doc_type": "passport"}, {"top_pct": 0.5, "height_pct": 0.5, "doc_type": "medical_reports"}]
+   Use non-overlapping, adjacent bands. Min height_pct 0.08 per region.
+
+4. Categories: cv_resume, passport, certificates, contracts, medical_reports, photos, other_documents.
+
+5. Identity: name, father_name, cnic, passport_no, email, phone, date_of_birth, document_number, nationality, passport_expiry, expiry_date, issue_date, place_of_issue.
+
+Return ONLY valid JSON:
+{
+  "layout": "single" | "multi",
+  "category": "category_name",
+  "confidence": 0.95,
+  "extracted_identity": { ... },
+  "regions": [{"top_pct": 0, "height_pct": 0.5, "doc_type": "passport"}, ...]
+}
+Omit "regions" when layout is "single". When "multi", "category" and "extracted_identity" apply to the primary/first region; we will re-classify each crop.
+"""
+
+
+def _normalize_identity(raw: dict) -> dict:
+    out = {k: raw.get(k) for k in (
+        "name", "father_name", "cnic", "passport_no", "email", "phone",
+        "date_of_birth", "dob", "document_number", "nationality",
+        "passport_expiry", "expiry_date", "issue_date", "place_of_issue",
+    )}
+    if out.get("expiry_date") and not out.get("passport_expiry"):
+        out["passport_expiry"] = out["expiry_date"]
+    if out.get("dob") and not out.get("date_of_birth"):
+        out["date_of_birth"] = out["dob"]
+    if out.get("date_of_birth") and not out.get("dob"):
+        out["dob"] = out["date_of_birth"]
+    return out
+
+
+def pdf_to_page_images(pdf_bytes: bytes) -> list[tuple[int, bytes]]:
+    """Convert PDF to list of (page_idx, png_bytes)."""
+    import fitz
+    from PIL import Image
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    result = []
+    for i in range(len(doc)):
+        page = doc[i]
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        result.append((i, buf.getvalue()))
+    doc.close()
+    return result
+
+
+def image_to_page_images(img_bytes: bytes) -> list[tuple[int, bytes]]:
+    """Single image -> one 'page'."""
+    return [(0, img_bytes)]
+
+
+def _parse_vision_json(text: str) -> dict[str, Any]:
+    if text.startswith("```json"):
+        text = text[7:]
+    if text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return json.loads(text.strip())
+
+
+async def classify_page_vision(image_base64: str, openai_api_key: str) -> dict[str, Any]:
+    """Call Vision API for one page; return category, confidence, extracted_identity."""
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(api_key=openai_api_key)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": VISION_PROMPT},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
+            ],
+        }
+    ]
+    resp = await client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        temperature=0.1,
+        max_tokens=2000,
+    )
+    text = resp.choices[0].message.content.strip()
+    data = _parse_vision_json(text)
+    identity = data.get("extracted_identity") or {}
+    data["extracted_identity"] = _normalize_identity(identity)
+    return data
+
+
+async def classify_page_vision_with_layout(image_base64: str, openai_api_key: str) -> dict[str, Any]:
+    """Vision layout + classification. Returns layout, category, confidence, identity, regions (if multi)."""
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(api_key=openai_api_key)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": VISION_LAYOUT_PROMPT},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
+            ],
+        }
+    ]
+    resp = await client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        temperature=0.1,
+        max_tokens=2000,
+    )
+    text = resp.choices[0].message.content.strip()
+    data = _parse_vision_json(text)
+    identity = data.get("extracted_identity") or {}
+    data["extracted_identity"] = _normalize_identity(identity)
+    data["layout"] = (data.get("layout") or "single").lower()
+    data["regions"] = data.get("regions") or []
+    return data
+
+
+def extract_pages_as_pdf_bytes(pdf_bytes: bytes, page_indices: list[int]) -> bytes:
+    """Extract given pages from PDF into a new PDF (bytes)."""
+    import fitz
+
+    src = fitz.open(stream=pdf_bytes, filetype="pdf")
+    dst = fitz.open()
+    for i in page_indices:
+        dst.insert_pdf(src, from_page=i, to_page=i)
+    buf = io.BytesIO()
+    dst.save(buf, deflate=True)
+    out = buf.getvalue()
+    src.close()
+    dst.close()
+    return out
+
+
+def image_bytes_to_pdf(img_bytes: bytes) -> bytes:
+    """Build 1-page PDF from image bytes (PNG/JPEG)."""
+    import fitz
+    from PIL import Image
+
+    doc = fitz.open()
+    pil = Image.open(io.BytesIO(img_bytes))
+    w, h = pil.size
+    page = doc.new_page(width=w, height=h)
+    img_bio = io.BytesIO()
+    pil.save(img_bio, format="PNG")
+    img_bio.seek(0)
+    page.insert_image(page.rect, stream=img_bio)
+    buf = io.BytesIO()
+    doc.save(buf, deflate=True)
+    out = buf.getvalue()
+    doc.close()
+    return out
+
+
+def apply_confidence_gate(category: str, confidence: float) -> tuple[str, float]:
+    """If confidence < threshold, map to other_documents."""
+    if confidence < CONFIDENCE_THRESHOLD:
+        return "other_documents", confidence
+    return category, confidence
+
+
+def needs_review_from_confidence(confidence: float) -> bool:
+    """True when confidence < threshold (ambiguous); no blocking."""
+    return confidence < CONFIDENCE_THRESHOLD
+
+
+def crop_image_by_band(img_bytes: bytes, top_pct: float, height_pct: float) -> bytes:
+    """Crop image to vertical band [top_pct, top_pct + height_pct]. Returns PNG bytes."""
+    from PIL import Image
+
+    pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    w, h = pil.size
+    y1 = max(0, int(top_pct * h))
+    y2 = min(h, int((top_pct + height_pct) * h))
+    cropped = pil.crop((0, y1, w, y2))
+    buf = io.BytesIO()
+    cropped.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+MIN_BAND_HEIGHT = 0.08
+
+
+def group_consecutive_pages(
+    documents: list[dict[str, Any]],
+    pdf_bytes: bytes | None,
+    is_pdf: bool,
+) -> list[dict[str, Any]]:
+    """
+    Phase 2 grouping: consecutive full-page units (split_strategy "page") with same doc_type
+    -> one logical document. Rebuild one multi-page PDF per group; set split_strategy "grouped".
+    Region units are never grouped; they stay as standalone 1-page docs.
+    """
+    out: list[dict[str, Any]] = []
+    group: list[dict[str, Any]] = []
+
+    def flush_group() -> None:
+        if not group:
+            return
+        if len(group) == 1:
+            out.append(group[0])
+            return
+        # Merge 2+ page-level docs from original PDF
+        pages_ordered = sorted(set(p for d in group for p in d["pages"]))
+        if not is_pdf or not pdf_bytes:
+            # Single image or no PDF: cannot merge; emit each as-is (should not reach 2+ with single page)
+            for d in group:
+                out.append(d)
+            return
+        merged_pdf = extract_pages_as_pdf_bytes(pdf_bytes, pages_ordered)
+        first = group[0]
+        conf_min = min(d["confidence"] for d in group)
+        any_review = any(d.get("needs_review", False) for d in group)
+        out.append({
+            "doc_type": first["doc_type"],
+            "pages": pages_ordered,
+            "regions": [],
+            "confidence": conf_min,
+            "identity": first.get("identity") or {},
+            "pdf_base64": base64.b64encode(merged_pdf).decode("utf-8"),
+            "split_strategy": "grouped",
+            "needs_review": any_review,
+        })
+
+    for doc in documents:
+        strategy = doc.get("split_strategy") or "page"
+        if strategy == "region":
+            flush_group()
+            group = []
+            out.append(doc)
+            continue
+        # strategy == "page"
+        pages = doc.get("pages") or []
+        page_idx = pages[0] if pages else -1
+        dtype = doc.get("doc_type") or "other_documents"
+        if not group:
+            group.append(doc)
+            continue
+        last_page = max(p for d in group for p in d["pages"]) if group else -2
+        same_type = (group[0].get("doc_type") or "other_documents") == dtype
+        consecutive = page_idx == last_page + 1
+        if same_type and consecutive:
+            group.append(doc)
+        else:
+            flush_group()
+            group = [doc]
+
+    flush_group()
+    return out
+
+
+def _append_doc(
+    documents: list[dict],
+    doc_type: str,
+    confidence: float,
+    identity: dict,
+    pdf_bytes: bytes,
+    page_idx: int,
+    regions: list,
+    split_strategy: str,
+) -> None:
+    nr = needs_review_from_confidence(confidence)
+    documents.append({
+        "doc_type": doc_type,
+        "pages": [page_idx],
+        "regions": regions,
+        "confidence": confidence,
+        "identity": identity,
+        "pdf_base64": base64.b64encode(pdf_bytes).decode("utf-8"),
+        "split_strategy": split_strategy,
+        "needs_review": nr,
+    })
+
+
+async def _process_page_textract_vision(
+    page_idx: int,
+    img_bytes: bytes,
+    pdf_bytes: bytes | None,
+    is_pdf: bool,
+    aws_region: str,
+    openai_api_key: str,
+    documents: list[dict],
+) -> None:
+    """Engine A: Textract layout -> regions; Vision classify. Per-page fallback to Vision on Textract error."""
+    from PIL import Image
+
+    pil = Image.open(io.BytesIO(img_bytes))
+    w, h = pil.size
+    regions: list[dict] = []
+    use_tx = False
+
+    if get_blocks_from_image and cluster_blocks_to_regions and validate_no_overlap and crop_image_to_region:
+        try:
+            blocks = get_blocks_from_image(img_bytes, region=aws_region)
+            regions = cluster_blocks_to_regions(blocks, w, h)
+            if len(regions) > 1 and validate_no_overlap(regions):
+                use_tx = True
+            else:
+                regions = [{"left": 0, "top": 0, "width": 1.0, "height": 1.0}]
+        except Exception as e:
+            logger.warning(f"[Split] Textract failed page {page_idx}: {e}, using Vision-only for this page")
+            regions = [{"left": 0, "top": 0, "width": 1.0, "height": 1.0}]
+
+    if not use_tx or len(regions) <= 1:
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
+        try:
+            v = await classify_page_vision(b64, openai_api_key)
+        except Exception as e:
+            logger.warning(f"[Split] Vision failed page {page_idx}: {e}")
+            v = {"category": "other_documents", "confidence": 0.0, "extracted_identity": {}}
+        cat = v.get("category") or "other_documents"
+        conf = float(v.get("confidence") or 0.0)
+        cat, conf = apply_confidence_gate(cat, conf)
+        identity = v.get("extracted_identity") or {}
+        pdf_one = extract_pages_as_pdf_bytes(pdf_bytes, [page_idx]) if is_pdf and pdf_bytes else image_bytes_to_pdf(img_bytes)
+        _append_doc(documents, cat, conf, identity, pdf_one, page_idx, [], "page")
+        return
+
+    for ri, reg in enumerate(regions):
+        try:
+            cropped = crop_image_to_region(img_bytes, reg)
+        except Exception as e:
+            logger.warning(f"[Split] Crop failed page {page_idx} region {ri}: {e}")
+            continue
+        b64 = base64.b64encode(cropped).decode("utf-8")
+        try:
+            v = await classify_page_vision(b64, openai_api_key)
+        except Exception as e:
+            logger.warning(f"[Split] Vision failed page {page_idx} region {ri}: {e}")
+            v = {"category": "other_documents", "confidence": 0.0, "extracted_identity": {}}
+        cat = v.get("category") or "other_documents"
+        conf = float(v.get("confidence") or 0.0)
+        cat, conf = apply_confidence_gate(cat, conf)
+        identity = v.get("extracted_identity") or {}
+        pdf_one = image_bytes_to_pdf(cropped)
+        _append_doc(documents, cat, conf, identity, pdf_one, page_idx, [reg], "region")
+
+
+async def _process_page_vision_only(
+    page_idx: int,
+    img_bytes: bytes,
+    pdf_bytes: bytes | None,
+    is_pdf: bool,
+    openai_api_key: str,
+    documents: list[dict],
+) -> None:
+    """Engine B: Vision layout + classification; optional multi-region bands + 2nd Vision per crop."""
+    b64 = base64.b64encode(img_bytes).decode("utf-8")
+    try:
+        v = await classify_page_vision_with_layout(b64, openai_api_key)
+    except Exception as e:
+        logger.warning(f"[Split] Vision layout failed page {page_idx}: {e}")
+        v = {"layout": "single", "category": "other_documents", "confidence": 0.0, "extracted_identity": {}, "regions": []}
+
+    layout = (v.get("layout") or "single").lower()
+    raw_regions = v.get("regions") or []
+    cat = v.get("category") or "other_documents"
+    conf = float(v.get("confidence") or 0.0)
+    identity = v.get("extracted_identity") or {}
+
+    if layout != "multi" or len(raw_regions) < 2:
+        cat, conf = apply_confidence_gate(cat, conf)
+        pdf_one = extract_pages_as_pdf_bytes(pdf_bytes, [page_idx]) if is_pdf and pdf_bytes else image_bytes_to_pdf(img_bytes)
+        _append_doc(documents, cat, conf, identity, pdf_one, page_idx, [], "page")
+        return
+
+    # Multi-region: validate bands (min height, non-overlapping), crop each, optional 2nd Vision pass
+    bands = []
+    for r in raw_regions:
+        top = float(r.get("top_pct") or 0)
+        height = float(r.get("height_pct") or 0)
+        if height < MIN_BAND_HEIGHT:
+            continue
+        bands.append({"top_pct": top, "height_pct": height, "doc_type_hint": r.get("doc_type")})
+
+    if not bands:
+        cat, conf = apply_confidence_gate(cat, conf)
+        pdf_one = extract_pages_as_pdf_bytes(pdf_bytes, [page_idx]) if is_pdf and pdf_bytes else image_bytes_to_pdf(img_bytes)
+        _append_doc(documents, cat, conf, identity, pdf_one, page_idx, [], "page")
+        return
+
+    for band in bands:
+        try:
+            cropped = crop_image_by_band(img_bytes, band["top_pct"], band["height_pct"])
+        except Exception as e:
+            logger.warning(f"[Split] Band crop failed page {page_idx}: {e}")
+            continue
+        cb64 = base64.b64encode(cropped).decode("utf-8")
+        try:
+            v2 = await classify_page_vision(cb64, openai_api_key)
+        except Exception as e:
+            logger.warning(f"[Split] Vision per-region failed page {page_idx}: {e}")
+            v2 = {"category": band.get("doc_type_hint") or "other_documents", "confidence": 0.0, "extracted_identity": {}}
+        rc = v2.get("category") or band.get("doc_type_hint") or "other_documents"
+        rconf = float(v2.get("confidence") or 0.0)
+        rc, rconf = apply_confidence_gate(rc, rconf)
+        ridentity = v2.get("extracted_identity") or {}
+        pdf_one = image_bytes_to_pdf(cropped)
+        reg = {"left": 0, "top": band["top_pct"], "width": 1.0, "height": band["height_pct"]}
+        _append_doc(documents, rc, rconf, ridentity, pdf_one, page_idx, [reg], "region")
+
+
+async def run_split_and_categorize(
+    file_content: bytes,
+    file_name: str,
+    is_pdf: bool,
+    openai_api_key: str,
+    candidate_data: Optional[dict] = None,
+    use_textract: Optional[bool] = None,
+) -> dict[str, Any]:
+    """
+    Dual OCR + Vision fallback. Detect engine once (Textract probe); never fail due to Textract.
+    Returns { success, engine_used, documents[] } with doc_type, pages, split_strategy, confidence, identity, pdf_base64, needs_review.
+    """
+    if is_pdf:
+        pages = pdf_to_page_images(file_content)
+        pdf_bytes = file_content
+    else:
+        pages = image_to_page_images(file_content)
+        pdf_bytes = None
+
+    aws_region = os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+    documents: list[dict[str, Any]] = []
+
+    engine_used = "vision_only"
+    if pages and aws_configured() and detect_engine is not None and (use_textract is None or use_textract):
+        first_img = pages[0][1]
+        engine_used = detect_engine(first_img, region=aws_region)
+
+    for page_idx, img_bytes in pages:
+        if engine_used == "textract+vision":
+            await _process_page_textract_vision(
+                page_idx, img_bytes, pdf_bytes, is_pdf, aws_region, openai_api_key, documents
+            )
+        else:
+            await _process_page_vision_only(
+                page_idx, img_bytes, pdf_bytes, is_pdf, openai_api_key, documents
+            )
+
+    # Phase 2: group consecutive full-page units (same doc_type) -> one PDF per group, split_strategy "grouped"
+    documents = group_consecutive_pages(documents, pdf_bytes, is_pdf)
+
+    return {"success": True, "engine_used": engine_used, "documents": documents}
