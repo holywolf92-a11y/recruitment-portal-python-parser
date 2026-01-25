@@ -37,15 +37,51 @@ except ImportError:
 
 CONFIDENCE_THRESHOLD = 0.88
 DOC_CATEGORIES = [
-    "cv_resume", "passport", "certificates", "contracts",
-    "medical_reports", "photos", "other_documents",
+    "cv_resume", "passport", "cnic", "driving_license", "police_character_certificate",
+    "certificates", "contracts", "medical_reports", "photos", "other_documents",
 ]
+
+def normalize_doc_type(category: str) -> str:
+    """
+    Normalize category to canonical doc_type.
+    Maps variations like 'national_id', 'id_card' -> 'cnic'
+    and 'character_certificate' -> 'police_character_certificate'
+    """
+    if not category:
+        return "other_documents"
+    
+    category_lower = category.lower().strip()
+    
+    # Map variations to canonical types
+    normalization_map = {
+        "national_id": "cnic",
+        "id_card": "cnic",
+        "nid": "cnic",
+        "character_certificate": "police_character_certificate",
+        "police_clearance": "police_character_certificate",
+        "pcc": "police_character_certificate",
+        "character_clearance": "police_character_certificate",
+    }
+    
+    # Check if category needs normalization
+    if category_lower in normalization_map:
+        return normalization_map[category_lower]
+    
+    # Return as-is if it's already a canonical type
+    if category_lower in DOC_CATEGORIES:
+        return category_lower
+    
+    # Default fallback
+    return "other_documents"
 
 VISION_PROMPT = """You are a document classification and identity extraction AI. Analyze this SINGLE page image and provide:
 
 1. Document category (choose ONE):
    - cv_resume: CV, resume, curriculum vitae
    - passport: Passport copy, passport scan
+   - cnic: Pakistani CNIC (National ID Card)
+   - driving_license: Driving license or driver's license
+   - police_character_certificate: Police character certificate or clearance certificate
    - certificates: Educational certificates, degrees, diplomas, training certificates
    - contracts: Employment contracts, offer letters, agreements
    - medical_reports: Medical test reports, health certificates, fitness certificates
@@ -409,9 +445,11 @@ async def _process_page_textract_vision(
         cat = v.get("category") or "other_documents"
         conf = float(v.get("confidence") or 0.0)
         cat, conf = apply_confidence_gate(cat, conf)
+        # Normalize category to canonical doc_type
+        doc_type = normalize_doc_type(cat)
         identity = v.get("extracted_identity") or {}
         pdf_one = extract_pages_as_pdf_bytes(pdf_bytes, [page_idx]) if is_pdf and pdf_bytes else image_bytes_to_pdf(img_bytes)
-        _append_doc(documents, cat, conf, identity, pdf_one, page_idx, [], "page")
+        _append_doc(documents, doc_type, conf, identity, pdf_one, page_idx, [], "page")
         return
 
     for ri, reg in enumerate(regions):
@@ -429,9 +467,11 @@ async def _process_page_textract_vision(
         cat = v.get("category") or "other_documents"
         conf = float(v.get("confidence") or 0.0)
         cat, conf = apply_confidence_gate(cat, conf)
+        # Normalize category to canonical doc_type
+        doc_type = normalize_doc_type(cat)
         identity = v.get("extracted_identity") or {}
         pdf_one = image_bytes_to_pdf(cropped)
-        _append_doc(documents, cat, conf, identity, pdf_one, page_idx, [reg], "region")
+        _append_doc(documents, doc_type, conf, identity, pdf_one, page_idx, [reg], "region")
 
 
 async def _process_page_vision_only(
@@ -458,8 +498,10 @@ async def _process_page_vision_only(
 
     if layout != "multi" or len(raw_regions) < 2:
         cat, conf = apply_confidence_gate(cat, conf)
+        # Normalize category to canonical doc_type
+        doc_type = normalize_doc_type(cat)
         pdf_one = extract_pages_as_pdf_bytes(pdf_bytes, [page_idx]) if is_pdf and pdf_bytes else image_bytes_to_pdf(img_bytes)
-        _append_doc(documents, cat, conf, identity, pdf_one, page_idx, [], "page")
+        _append_doc(documents, doc_type, conf, identity, pdf_one, page_idx, [], "page")
         return
 
     # Multi-region: validate bands (min height, non-overlapping), crop each, optional 2nd Vision pass
@@ -473,8 +515,10 @@ async def _process_page_vision_only(
 
     if not bands:
         cat, conf = apply_confidence_gate(cat, conf)
+        # Normalize category to canonical doc_type
+        doc_type = normalize_doc_type(cat)
         pdf_one = extract_pages_as_pdf_bytes(pdf_bytes, [page_idx]) if is_pdf and pdf_bytes else image_bytes_to_pdf(img_bytes)
-        _append_doc(documents, cat, conf, identity, pdf_one, page_idx, [], "page")
+        _append_doc(documents, doc_type, conf, identity, pdf_one, page_idx, [], "page")
         return
 
     for band in bands:
@@ -492,10 +536,12 @@ async def _process_page_vision_only(
         rc = v2.get("category") or band.get("doc_type_hint") or "other_documents"
         rconf = float(v2.get("confidence") or 0.0)
         rc, rconf = apply_confidence_gate(rc, rconf)
+        # Normalize category to canonical doc_type
+        rdoc_type = normalize_doc_type(rc)
         ridentity = v2.get("extracted_identity") or {}
         pdf_one = image_bytes_to_pdf(cropped)
         reg = {"left": 0, "top": band["top_pct"], "width": 1.0, "height": band["height_pct"]}
-        _append_doc(documents, rc, rconf, ridentity, pdf_one, page_idx, [reg], "region")
+        _append_doc(documents, rdoc_type, rconf, ridentity, pdf_one, page_idx, [reg], "region")
 
 
 async def run_split_and_categorize(

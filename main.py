@@ -103,6 +103,9 @@ You are a document classifier and identity extractor. Analyze the document and:
 CATEGORIES (choose ONE):
 - cv_resume: CV, resume, or employment history
 - passport: Passport document
+- cnic: Pakistani CNIC (National ID Card)
+- driving_license: Driving license or driver's license
+- police_character_certificate: Police character certificate or clearance certificate
 - certificates: Degrees, diplomas, certifications
 - contracts: Employment contracts, agreements
 - medical_reports: Medical certificates, health reports
