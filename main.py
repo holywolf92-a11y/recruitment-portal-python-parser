@@ -1002,6 +1002,15 @@ async def categorize_document_with_ai_text(text_content: str, file_name: str, mi
         
         logger.info(f"[DocumentCategorization] Processing text content - {len(text_content)} characters from {file_name}")
         
+        # Truncate text_content if too large to avoid token limit errors
+        # gpt-4o-mini has TPM limit of 200,000 tokens
+        # Rough estimate: 1 token ≈ 4 characters, so ~50,000 chars ≈ 12,500 tokens
+        # Leave room for prompt (~500 tokens) and response (~1000 tokens)
+        MAX_TEXT_LENGTH = 50000  # ~12,500 tokens
+        if len(text_content) > MAX_TEXT_LENGTH:
+            logger.warning(f"[DocumentCategorization] Text content too large ({len(text_content)} chars), truncating to {MAX_TEXT_LENGTH} chars")
+            text_content = text_content[:MAX_TEXT_LENGTH] + "\n\n[... content truncated due to size ...]"
+        
         # Prepare OpenAI prompt for document categorization
         prompt = f"""
 You are a document classification and identity extraction AI. Analyze the following document content and provide:
