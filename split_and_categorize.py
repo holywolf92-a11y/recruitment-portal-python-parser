@@ -240,8 +240,9 @@ def image_bytes_to_pdf(img_bytes: bytes) -> bytes:
     page = doc.new_page(width=w, height=h)
     img_bio = io.BytesIO()
     pil.save(img_bio, format="PNG")
-    img_bio.seek(0)
-    page.insert_image(page.rect, stream=img_bio)
+    # IMPORTANT: PyMuPDF expects raw bytes for `stream=...`, not a BytesIO object.
+    # Passing BytesIO can lead to blank pages in some environments.
+    page.insert_image(page.rect, stream=img_bio.getvalue())
     buf = io.BytesIO()
     doc.save(buf, deflate=True)
     out = buf.getvalue()
