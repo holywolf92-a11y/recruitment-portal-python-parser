@@ -973,7 +973,10 @@ def upload_photo_to_supabase(image_bytes: bytes, attachment_id: str, file_ext: s
 
 async def categorize_document_with_ai_text(text_content: str, file_name: str, mime_type: str) -> dict:
     """
-    Use OpenAI to categorize document and extract identity fields.
+    Use OpenAI to categorize document and extract identity fields from already-extracted text.
+    
+    This function receives text_content that has already been extracted from a PDF/image.
+    It uses GPT to categorize the document and extract identity information.
     
     Returns:
     {
@@ -993,49 +996,11 @@ async def categorize_document_with_ai_text(text_content: str, file_name: str, mi
     }
     """
     try:
-        # Decode base64 content
-        import base64
-        # Ensure base64 string is properly padded (must be multiple of 4)
-        if isinstance(file_content, str):
-            file_content = file_content.strip()
-            # Add padding if needed (base64 strings must be multiples of 4)
-            missing_padding = len(file_content) % 4
-            if missing_padding:
-                file_content += '=' * (4 - missing_padding)
+        # Ensure text_content is a string
+        if not isinstance(text_content, str):
+            text_content = str(text_content) if text_content else ""
         
-        try:
-            # Use validate=False to be more lenient with padding
-            file_bytes = base64.b64decode(file_content, validate=False)
-        except Exception as decode_error:
-            logger.error(f"[DocumentCategorization] Base64 decode error: {decode_error}, content length: {len(file_content) if file_content else 0}, first 50 chars: {file_content[:50] if file_content else 'None'}")
-            raise HTTPException(status_code=400, detail=f"Invalid base64-encoded file content: {str(decode_error)}")
-        
-        # Use OpenAI Vision API to read documents directly (much more reliable than text extraction)
-        # Vision API accepts: PNG, JPEG, GIF, WebP (NOT PDFs directly)
-        # So we need to:
-        # 1. For PDFs: Convert pages to images, then send images
-        # 2. For images: Send directly (just encode as base64)
-        # 3. For text files: Extract text and send to text-based API
-        
-        if mime_type == "application/pdf":
-            # PDF: Convert pages to images, then send to Vision API
-            logger.info(f"[DocumentCategorization] PDF detected - converting to images for Vision API: {file_name}")
-            result = await categorize_document_with_vision_api(file_bytes, file_name, is_pdf=True)
-            return result
-        elif mime_type in ["image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"]:
-            # Image: Send directly to Vision API (just encode as base64)
-            logger.info(f"[DocumentCategorization] Image detected - sending directly to Vision API: {file_name}")
-            result = await categorize_document_with_vision_api(file_bytes, file_name, is_pdf=False)
-            return result
-        else:
-            # Text files: Extract text and use text-based API
-            text_content = ""
-            try:
-                text_content = file_bytes.decode('utf-8', errors='ignore')
-            except:
-                text_content = str(file_bytes)
-            
-            logger.info(f"[DocumentCategorization] Text file - extracted {len(text_content)} characters from {file_name}")
+        logger.info(f"[DocumentCategorization] Processing text content - {len(text_content)} characters from {file_name}")
         
         # Prepare OpenAI prompt for document categorization
         prompt = f"""
