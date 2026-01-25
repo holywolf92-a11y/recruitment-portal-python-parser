@@ -794,7 +794,7 @@ Extract this information even if labels are slightly different."""
         logger.error(f"[VisionAPI] Traceback: {traceback.format_exc()}")
         # Fallback to text extraction if Vision API fails
         logger.warning(f"[VisionAPI] Falling back to text extraction method")
-        text_content = extract_text_from_pdf(pdf_content)
+        text_content = extract_text_from_pdf(file_content)
         # Continue with text-based categorization
         return await categorize_document_with_ai_text(text_content, file_name, "application/pdf")
 
