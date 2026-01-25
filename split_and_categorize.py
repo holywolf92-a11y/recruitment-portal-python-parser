@@ -57,6 +57,12 @@ def normalize_doc_type(category: str) -> str:
         "national_id": "cnic",
         "id_card": "cnic",
         "nid": "cnic",
+        "driving_license": "driving_license",  # Explicit mapping for consistency
+        "drivers_license": "driving_license",
+        "driver_license": "driving_license",
+        "drivers_licence": "driving_license",  # British spelling
+        "driving_licence": "driving_license",  # British spelling
+        "dl": "driving_license",  # Common abbreviation
         "character_certificate": "police_character_certificate",
         "police_clearance": "police_character_certificate",
         "pcc": "police_character_certificate",
@@ -136,7 +142,7 @@ VISION_LAYOUT_PROMPT = """You are a document layout and classification AI. Analy
    Example: passport on top 50%%, medical on bottom 50%% -> regions: [{"top_pct": 0, "height_pct": 0.5, "doc_type": "passport"}, {"top_pct": 0.5, "height_pct": 0.5, "doc_type": "medical_reports"}]
    Use non-overlapping, adjacent bands. Min height_pct 0.08 per region.
 
-4. Categories: cv_resume, passport, certificates, contracts, medical_reports, photos, other_documents.
+4. Categories: cv_resume, passport, cnic, driving_license, police_character_certificate, certificates, contracts, medical_reports, photos, other_documents.
 
 5. Identity: name, father_name, cnic, passport_no, email, phone, date_of_birth, document_number, nationality, passport_expiry, expiry_date, issue_date, place_of_issue.
 
