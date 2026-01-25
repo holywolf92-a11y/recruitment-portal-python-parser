@@ -94,6 +94,13 @@ VISION_PROMPT = """You are a document classification and identity extraction AI.
    - name, father_name, cnic, passport_no, email, phone
    - date_of_birth, document_number, nationality
    - passport_expiry, expiry_date, issue_date, place_of_issue
+   
+   CRITICAL NATIONALITY RULES:
+   - If document category is "cnic" (Pakistani CNIC), nationality MUST be "Pakistani"
+   - If document category is "passport" AND passport_no starts with "PA" or "AB", nationality MUST be "Pakistani"
+   - Extract nationality ONLY from explicit "Nationality:" or "Citizenship:" fields
+   - Do NOT extract nationality from work experience locations or country_of_interest
+   - For CVs: If you see "Worked in Saudi Arabia", that is NOT nationality - that's work location
 
 Return ONLY valid JSON:
 {
@@ -157,6 +164,39 @@ def _normalize_identity(raw: dict) -> dict:
         out["date_of_birth"] = out["dob"]
     if out.get("date_of_birth") and not out.get("dob"):
         out["dob"] = out["date_of_birth"]
+    
+    # CRITICAL: Validate nationality based on document indicators
+    # Pakistani CNIC or Pakistani Passport MUST have nationality = "Pakistani"
+    cnic_value = out.get("cnic") or ""
+    passport_value = out.get("passport_no") or ""
+    place_of_issue = out.get("place_of_issue") or ""
+    
+    # Check if this is a Pakistani document
+    is_pakistani_doc = False
+    
+    # Check CNIC format (Pakistani CNIC format: 12345-1234567-1 or 13 digits)
+    if cnic_value:
+        cnic_clean = cnic_value.replace("-", "").replace(" ", "")
+        if len(cnic_clean) == 13 and cnic_clean.isdigit():
+            is_pakistani_doc = True
+    
+    # Check passport number (Pakistani passports usually start with PA, AB, or similar)
+    if passport_value:
+        passport_upper = passport_value.upper().strip()
+        if passport_upper.startswith("PA") or passport_upper.startswith("AB"):
+            is_pakistani_doc = True
+    
+    # Check place of issue (Pakistani cities)
+    pakistani_cities = ["islamabad", "karachi", "lahore", "peshawar", "quetta", "multan", "faisalabad", "rawalpindi"]
+    if place_of_issue.lower() in pakistani_cities:
+        is_pakistani_doc = True
+    
+    # If it's a Pakistani document, enforce nationality
+    if is_pakistani_doc:
+        if out.get("nationality") and out.get("nationality").lower() != "pakistani":
+            logger.warning(f"Overriding nationality from '{out.get('nationality')}' to 'Pakistani' based on document indicators (CNIC/Passport)")
+        out["nationality"] = "Pakistani"
+    
     return out
 
 
@@ -448,6 +488,14 @@ async def _process_page_textract_vision(
         # Normalize category to canonical doc_type
         doc_type = normalize_doc_type(cat)
         identity = v.get("extracted_identity") or {}
+        
+        # CRITICAL: Enforce nationality for Pakistani documents
+        if doc_type in ['cnic', 'passport']:
+            # If document is CNIC or Passport, enforce Pakistani nationality
+            if identity.get("nationality") and identity.get("nationality").lower() != "pakistani":
+                logger.warning(f"Overriding nationality from '{identity.get('nationality')}' to 'Pakistani' for {doc_type} document")
+            identity["nationality"] = "Pakistani"
+        
         pdf_one = extract_pages_as_pdf_bytes(pdf_bytes, [page_idx]) if is_pdf and pdf_bytes else image_bytes_to_pdf(img_bytes)
         _append_doc(documents, doc_type, conf, identity, pdf_one, page_idx, [], "page")
         return
@@ -470,6 +518,14 @@ async def _process_page_textract_vision(
         # Normalize category to canonical doc_type
         doc_type = normalize_doc_type(cat)
         identity = v.get("extracted_identity") or {}
+        
+        # CRITICAL: Enforce nationality for Pakistani documents
+        if doc_type in ['cnic', 'passport']:
+            # If document is CNIC or Passport, enforce Pakistani nationality
+            if identity.get("nationality") and identity.get("nationality").lower() != "pakistani":
+                logger.warning(f"Overriding nationality from '{identity.get('nationality')}' to 'Pakistani' for {doc_type} document (region)")
+            identity["nationality"] = "Pakistani"
+        
         pdf_one = image_bytes_to_pdf(cropped)
         _append_doc(documents, doc_type, conf, identity, pdf_one, page_idx, [reg], "region")
 
@@ -500,6 +556,14 @@ async def _process_page_vision_only(
         cat, conf = apply_confidence_gate(cat, conf)
         # Normalize category to canonical doc_type
         doc_type = normalize_doc_type(cat)
+        
+        # CRITICAL: Enforce nationality for Pakistani documents
+        if doc_type in ['cnic', 'passport']:
+            # If document is CNIC or Passport, enforce Pakistani nationality
+            if identity.get("nationality") and identity.get("nationality").lower() != "pakistani":
+                logger.warning(f"Overriding nationality from '{identity.get('nationality')}' to 'Pakistani' for {doc_type} document (vision-only single)")
+            identity["nationality"] = "Pakistani"
+        
         pdf_one = extract_pages_as_pdf_bytes(pdf_bytes, [page_idx]) if is_pdf and pdf_bytes else image_bytes_to_pdf(img_bytes)
         _append_doc(documents, doc_type, conf, identity, pdf_one, page_idx, [], "page")
         return
@@ -517,6 +581,14 @@ async def _process_page_vision_only(
         cat, conf = apply_confidence_gate(cat, conf)
         # Normalize category to canonical doc_type
         doc_type = normalize_doc_type(cat)
+        
+        # CRITICAL: Enforce nationality for Pakistani documents
+        if doc_type in ['cnic', 'passport']:
+            # If document is CNIC or Passport, enforce Pakistani nationality
+            if identity.get("nationality") and identity.get("nationality").lower() != "pakistani":
+                logger.warning(f"Overriding nationality from '{identity.get('nationality')}' to 'Pakistani' for {doc_type} document (vision-only fallback)")
+            identity["nationality"] = "Pakistani"
+        
         pdf_one = extract_pages_as_pdf_bytes(pdf_bytes, [page_idx]) if is_pdf and pdf_bytes else image_bytes_to_pdf(img_bytes)
         _append_doc(documents, doc_type, conf, identity, pdf_one, page_idx, [], "page")
         return
@@ -539,6 +611,14 @@ async def _process_page_vision_only(
         # Normalize category to canonical doc_type
         rdoc_type = normalize_doc_type(rc)
         ridentity = v2.get("extracted_identity") or {}
+        
+        # CRITICAL: Enforce nationality for Pakistani documents
+        if rdoc_type in ['cnic', 'passport']:
+            # If document is CNIC or Passport, enforce Pakistani nationality
+            if ridentity.get("nationality") and ridentity.get("nationality").lower() != "pakistani":
+                logger.warning(f"Overriding nationality from '{ridentity.get('nationality')}' to 'Pakistani' for {rdoc_type} document (multi-region)")
+            ridentity["nationality"] = "Pakistani"
+        
         pdf_one = image_bytes_to_pdf(cropped)
         reg = {"left": 0, "top": band["top_pct"], "width": 1.0, "height": band["height_pct"]}
         _append_doc(documents, rdoc_type, rconf, ridentity, pdf_one, page_idx, [reg], "region")

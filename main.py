@@ -121,11 +121,18 @@ IDENTITY FIELDS TO EXTRACT (return null if not found):
 - phone: Phone number
 - date_of_birth: Date of birth (format: DD-MM-YYYY or YYYY-MM-DD)
 - document_number: Any other ID number found
-- nationality: Nationality (e.g., Pakistani, Indian, etc.)
+- nationality: Nationality/citizenship (e.g., Pakistani, Indian, etc.) - CRITICAL RULES:
+  * Extract ONLY the person's citizenship/nationality, NOT the country they worked in or want to work in
+  * Look for "Nationality:", "Citizenship:", "Country of Origin:", or in passport/CNIC documents
+  * If document is Pakistani CNIC (category = "cnic"), nationality MUST be "Pakistani" - do not extract from other fields
+  * If document is Pakistani Passport (category = "passport" AND passport_no starts with "PA" or "AB"), nationality MUST be "Pakistani"
+  * For CVs: Extract nationality ONLY from personal information section labeled "Nationality:" or "Citizenship:" - do NOT use work experience locations or country_of_interest
+  * If you see "Worked in Saudi Arabia" or "Seeking opportunities in UAE", that is NOT nationality - those are work locations or country_of_interest
 - passport_expiry: Passport expiry date (format: DD-MM-YYYY or YYYY-MM-DD)
 - expiry_date: Alternative field for passport expiry date
 - issue_date: Passport issue date (format: DD-MM-YYYY or YYYY-MM-DD)
 - place_of_issue: Place where passport was issued (e.g., Islamabad, Karachi)
+- country_of_interest: Country of interest/destination (ONLY for police_character_certificate documents - extract the country mentioned in the certificate, e.g., "UAE", "Saudi Arabia", "Qatar"). For other documents, leave null.
 
 Document Content:
 {content[:4000]}
@@ -211,6 +218,63 @@ Return ONLY valid JSON:
         # Ensure passport_expiry or expiry_date is set (prefer passport_expiry)
         if identity_fields.get("expiry_date") and not identity_fields.get("passport_expiry"):
             identity_fields["passport_expiry"] = identity_fields["expiry_date"]
+        
+        # CRITICAL: Validate nationality based on document type
+        # Pakistani CNIC or Pakistani Passport MUST have nationality = "Pakistani"
+        if category in ['cnic', 'passport']:
+            # Check if this is a Pakistani document
+            is_pakistani_doc = False
+            
+            # Check CNIC format (Pakistani CNIC format: 12345-1234567-1 or 13 digits)
+            cnic_value = identity_fields.get("cnic") or ""
+            if cnic_value:
+                # Remove dashes and spaces
+                cnic_clean = cnic_value.replace("-", "").replace(" ", "")
+                if len(cnic_clean) == 13 and cnic_clean.isdigit():
+                    is_pakistani_doc = True
+            
+            # Check passport number (Pakistani passports usually start with PA, AB, or similar)
+            passport_value = identity_fields.get("passport_no") or ""
+            if passport_value:
+                passport_upper = passport_value.upper().strip()
+                if passport_upper.startswith("PA") or passport_upper.startswith("AB"):
+                    is_pakistani_doc = True
+            
+            # Check place of issue (Pakistani cities)
+            place_of_issue = identity_fields.get("place_of_issue") or ""
+            pakistani_cities = ["islamabad", "karachi", "lahore", "peshawar", "quetta", "multan", "faisalabad", "rawalpindi"]
+            if place_of_issue.lower() in pakistani_cities:
+                is_pakistani_doc = True
+            
+            # If document type is CNIC or Passport and it appears to be Pakistani, enforce nationality
+            if is_pakistani_doc or category == 'cnic':
+                if identity_fields.get("nationality") and identity_fields.get("nationality").lower() != "pakistani":
+                    logger.warning(f"Overriding nationality from '{identity_fields.get('nationality')}' to 'Pakistani' for {category} document")
+                identity_fields["nationality"] = "Pakistani"
+            
+            # Special handling for Police Character Certificate: Extract country_of_interest
+            if category == 'police_character_certificate':
+                # Extract country_of_interest from document content if not already set
+                if not identity_fields.get("country_of_interest"):
+                    # Check common patterns in PCC documents
+                    content_lower = content.lower()
+                    pcc_countries = {
+                        'uae': 'UAE',
+                        'united arab emirates': 'UAE',
+                        'dubai': 'UAE',
+                        'saudi arabia': 'Saudi Arabia',
+                        'ksa': 'Saudi Arabia',
+                        'qatar': 'Qatar',
+                        'kuwait': 'Kuwait',
+                        'bahrain': 'Bahrain',
+                        'oman': 'Oman'
+                    }
+                    for keyword, country in pcc_countries.items():
+                        if keyword in content_lower:
+                            identity_fields["country_of_interest"] = country
+                            logger.info(f"Extracted country_of_interest '{country}' from Police Character Certificate")
+                            break
+        
         logger.info(f"Categorized document: {filename} as {category} with confidence {confidence}")
         return {
             "category": category,
@@ -237,10 +301,10 @@ Return ONLY valid JSON with these exact fields (use null for missing data):
   "email": "string or null",
   "phone": "string or null",
   "location": "string or null",
-  "nationality": "string or null (country of origin/citizenship - look for 'Nationality:', 'Country:', or in personal info section)",
-  "position": "string or null (desired job position/profession/title)",
+  "nationality": "string or null (country of origin/citizenship) - CRITICAL: Extract ONLY from 'Nationality:' or 'Citizenship:' field in personal info section. Do NOT use work experience locations (e.g., 'Worked in Saudi Arabia' is NOT nationality). Do NOT use country_of_interest. If CNIC format is Pakistani (13 digits) or Passport starts with PA/AB, nationality MUST be 'Pakistani'.",
+  "position": "string or null (desired job position/profession/title) - Normalize driver positions: HTV Driver, Heavy Duty Driver, Light Vehicle Driver, Simple Driver should all be normalized to 'Driver' or 'Driver (HTV)' if heavy vehicle",
   "experience_years": "number or null (total years of professional work experience)",
-  "country_of_interest": "string or null (country they want to work in, check objective/career goals)",
+  "country_of_interest": "string or null (country they want to work in) - Extract from: 1) Objective/career goals (e.g., 'seeking opportunities in UAE'), 2) Work experience locations (if candidate worked in Gulf countries like Saudi Arabia, UAE, Qatar, Kuwait, Bahrain, Oman, that indicates country_of_interest). Do NOT confuse with nationality.",
   "linkedin_url": "string or null",
   "summary": "string or null",
   "professional_summary": "string or null (2-3 sentence career summary)",
@@ -271,7 +335,8 @@ Return ONLY valid JSON with these exact fields (use null for missing data):
   "certifications": ["array of strings"],
   "languages": ["array of strings"],
   "previous_employment": "string or null (brief summary of work history)",
-  "passport_expiry": "string or null (format: YYYY-MM-DD)"
+  "passport_expiry": "string or null (format: YYYY-MM-DD)",
+  "gcc_years": "number or null (total years of work experience in GCC countries: Saudi Arabia, UAE, Qatar, Kuwait, Bahrain, Oman) - Calculate from experience array by summing years worked in GCC locations"
 }}
 
 IMPORTANT Guidelines:
@@ -283,7 +348,9 @@ IMPORTANT Guidelines:
 - Extract marital_status from personal information, look for "Marital Status:", "Status:", or keywords like "Married", "Single", "Divorced"
 - Extract position from objective, desired role, or most recent job title
 - Calculate experience_years from work history timeline if not stated
-- Look for country_of_interest in objective/goal statements (e.g., "seeking opportunities in UAE")
+- Extract country_of_interest from: 1) Objective/goal statements (e.g., "seeking opportunities in UAE"), 2) Work experience locations (if worked in Gulf countries, that's country_of_interest, not nationality)
+- Calculate gcc_years: Sum all years worked in GCC countries (Saudi Arabia, UAE, Qatar, Kuwait, Bahrain, Oman) from experience array
+- Normalize driver positions: HTV Driver, Heavy Duty Driver, Light Vehicle Driver, Simple Driver → "Driver" or "Driver (HTV)"
 - Extract ALL skills mentioned (technical, soft skills, software, languages, certifications)
 - For skills, include programming languages, tools, frameworks, soft skills
 - Be thorough in skills extraction - don't miss any mentioned abilities
@@ -317,6 +384,99 @@ Return only the JSON object, no explanation.
 
         result_text = result_text.strip()
         parsed_data = json.loads(result_text)
+        
+        # Post-processing: Normalize driver positions
+        position = parsed_data.get('position', '').strip() if parsed_data.get('position') else ''
+        if position:
+            position_lower = position.lower()
+            # Normalize all driver variants to "Driver"
+            driver_variants = ['htv driver', 'heavy duty driver', 'heavy vehicle driver', 
+                             'light vehicle driver', 'light duty driver', 'simple driver', 
+                             'driver', 'truck driver', 'bus driver', 'van driver']
+            if any(variant in position_lower for variant in driver_variants):
+                # Keep sub-type if present (e.g., "HTV Driver" -> "Driver (HTV)")
+                if 'htv' in position_lower or 'heavy' in position_lower:
+                    parsed_data['position'] = 'Driver (HTV)'
+                elif 'light' in position_lower:
+                    parsed_data['position'] = 'Driver (Light Vehicle)'
+                else:
+                    parsed_data['position'] = 'Driver'
+                logger.info(f"Normalized position from '{position}' to '{parsed_data['position']}'")
+        
+        # Post-processing: Calculate GCC years from work experience
+        gcc_countries = ['saudi arabia', 'uae', 'united arab emirates', 'qatar', 'kuwait', 
+                        'bahrain', 'oman', 'gcc', 'gulf']
+        experience_array = parsed_data.get('experience', [])
+        gcc_years = 0
+        
+        if isinstance(experience_array, list):
+            for exp in experience_array:
+                if not isinstance(exp, dict):
+                    continue
+                location = (exp.get('location') or '').lower()
+                start_date = exp.get('start_date')
+                end_date = exp.get('end_date') or 'Present'
+                
+                # Check if location is in GCC
+                is_gcc = any(gcc_country in location for gcc_country in gcc_countries)
+                
+                if is_gcc and start_date:
+                    try:
+                        # Try to parse dates and calculate years
+                        # Simple year extraction (format: YYYY-MM-DD or YYYY)
+                        start_year = None
+                        end_year = None
+                        
+                        if '-' in start_date:
+                            start_year = int(start_date.split('-')[0])
+                        elif len(start_date) == 4 and start_date.isdigit():
+                            start_year = int(start_date)
+                        
+                        if end_date.lower() == 'present' or end_date.lower() == 'current':
+                            end_year = datetime.now().year
+                        elif '-' in end_date:
+                            end_year = int(end_date.split('-')[0])
+                        elif len(end_date) == 4 and end_date.isdigit():
+                            end_year = int(end_date)
+                        
+                        if start_year and end_year:
+                            years = max(0, end_year - start_year)
+                            gcc_years += years
+                    except (ValueError, AttributeError):
+                        # If date parsing fails, estimate 1 year per GCC job
+                        gcc_years += 1
+        
+        if gcc_years > 0:
+            parsed_data['gcc_years'] = gcc_years
+            logger.info(f"Calculated GCC years: {gcc_years} from work experience")
+        
+        # Post-processing: Enhance country_of_interest from work experience
+        if not parsed_data.get('country_of_interest') or parsed_data.get('country_of_interest') == 'missing':
+            # Extract from work experience locations
+            countries_found = set()
+            for exp in experience_array:
+                if isinstance(exp, dict):
+                    location = exp.get('location', '')
+                    if location:
+                        location_lower = location.lower()
+                        # Map common variations
+                        if 'saudi' in location_lower or 'ksa' in location_lower:
+                            countries_found.add('Saudi Arabia')
+                        elif 'uae' in location_lower or 'united arab emirates' in location_lower or 'dubai' in location_lower:
+                            countries_found.add('UAE')
+                        elif 'qatar' in location_lower:
+                            countries_found.add('Qatar')
+                        elif 'kuwait' in location_lower:
+                            countries_found.add('Kuwait')
+                        elif 'bahrain' in location_lower:
+                            countries_found.add('Bahrain')
+                        elif 'oman' in location_lower:
+                            countries_found.add('Oman')
+            
+            if countries_found:
+                # Use most common or first country
+                parsed_data['country_of_interest'] = list(countries_found)[0]
+                logger.info(f"Extracted country_of_interest from work experience: {parsed_data['country_of_interest']}")
         
         # Add "missing" default for country_of_interest if null or empty
         if not parsed_data.get('country_of_interest'):
