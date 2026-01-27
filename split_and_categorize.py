@@ -414,9 +414,8 @@ def extract_photo_from_pdf_page(pdf_bytes: bytes, page_num: int = 0) -> bytes:
                     if image_ext.lower() in ['jpg', 'jpeg']:
                         jpeg_bytes = image_bytes
                     else:
-                        # Convert using PIL
-                        pil_image = Image.open(io.BytesIO(image_bytes))
-                        jpeg_bytes = extract_photo_as_jpeg(pil_image.tobytes())
+                        # Convert using PIL - pass the original image_bytes, not raw pixels!
+                        jpeg_bytes = extract_photo_as_jpeg(image_bytes)
                     
                     jpeg_images.append(jpeg_bytes)
                     
