@@ -338,16 +338,25 @@ def extract_photo_as_jpeg(img_bytes: bytes) -> bytes:
     This ensures photos are stored as actual images, not PDFs.
     Returns JPEG bytes suitable for direct storage and display.
     
-    Version: 2.0.0 - Production-grade JPEG extraction
+    Version: 2.1.0 - Enhanced with embedded image extraction
     """
     from PIL import Image
     
     try:
         # Open and convert to RGB (handles PNG with transparency, etc.)
-        pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        pil = Image.open(io.BytesIO(img_bytes))
         
         # Log image info
         logger.info(f"[PhotoExtract] Converting image to JPEG: {pil.size[0]}x{pil.size[1]}px, mode={pil.mode}")
+        
+        # Handle different image modes
+        if pil.mode == 'RGBA':
+            # Create white background for transparency
+            rgb_image = Image.new('RGB', pil.size, (255, 255, 255))
+            rgb_image.paste(pil, mask=pil.split()[3])  # Use alpha channel as mask
+            pil = rgb_image
+        elif pil.mode != 'RGB':
+            pil = pil.convert('RGB')
         
         # Save as high-quality JPEG
         buf = io.BytesIO()
@@ -360,6 +369,96 @@ def extract_photo_as_jpeg(img_bytes: bytes) -> bytes:
         return jpeg_bytes
     except Exception as e:
         logger.error(f"[PhotoExtract] ❌ Failed to convert image to JPEG: {e}")
+        raise
+
+
+def extract_photo_from_pdf_page(pdf_bytes: bytes, page_num: int = 0) -> bytes:
+    """
+    Extract photo from PDF page as JPEG.
+    
+    Strategy:
+    1. Try to extract embedded images first (proper way for photos)
+    2. If no images found, convert entire page to JPEG (fallback)
+    3. Return the largest image if multiple found
+    
+    Version: 2.1.0 - Proper embedded image extraction
+    Returns: JPEG bytes
+    """
+    import fitz
+    from PIL import Image
+    
+    logger.info(f"[PhotoExtract] v2.1 - Extracting photo from PDF page {page_num}")
+    
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page = doc[page_num]
+        
+        # Try to extract embedded images first (PROPER WAY)
+        image_list = page.get_images(full=True)
+        logger.info(f"[PhotoExtract] Found {len(image_list)} embedded images on page")
+        
+        if image_list:
+            # Extract all embedded images
+            jpeg_images = []
+            
+            for img_index, img_info in enumerate(image_list):
+                try:
+                    xref = img_info[0]
+                    base_image = doc.extract_image(xref)
+                    image_bytes = base_image["image"]
+                    image_ext = base_image["ext"]
+                    
+                    logger.info(f"[PhotoExtract] Image {img_index + 1}: {image_ext}, {len(image_bytes)} bytes")
+                    
+                    # Convert to JPEG if not already
+                    if image_ext.lower() in ['jpg', 'jpeg']:
+                        jpeg_bytes = image_bytes
+                    else:
+                        # Convert using PIL
+                        pil_image = Image.open(io.BytesIO(image_bytes))
+                        jpeg_bytes = extract_photo_as_jpeg(pil_image.tobytes())
+                    
+                    jpeg_images.append(jpeg_bytes)
+                    
+                except Exception as e:
+                    logger.warning(f"[PhotoExtract] Failed to extract image {img_index + 1}: {e}")
+                    continue
+            
+            if jpeg_images:
+                # Return largest image (likely the main photo)
+                largest = max(jpeg_images, key=len)
+                logger.info(f"[PhotoExtract] ✅ Extracted {len(jpeg_images)} image(s), using largest ({len(largest)} bytes)")
+                doc.close()
+                return largest
+        
+        # Fallback: Convert entire page to JPEG
+        logger.warning(f"[PhotoExtract] No embedded images found, converting entire page to JPEG")
+        
+        mat = fitz.Matrix(2.0, 2.0)  # 2x scale for quality
+        pix = page.get_pixmap(matrix=mat)
+        
+        logger.info(f"[PhotoExtract] Rendered page: {pix.width}x{pix.height}px")
+        
+        # Convert pixmap to JPEG via PIL
+        img_data = pix.tobytes("ppm")
+        pil_image = Image.open(io.BytesIO(img_data))
+        
+        if pil_image.mode != 'RGB':
+            pil_image = pil_image.convert('RGB')
+        
+        buf = io.BytesIO()
+        pil_image.save(buf, format="JPEG", quality=95, optimize=True)
+        jpeg_bytes = buf.getvalue()
+        
+        logger.info(f"[PhotoExtract] ✅ Converted page to JPEG: {len(jpeg_bytes)} bytes")
+        
+        doc.close()
+        pix = None
+        
+        return jpeg_bytes
+        
+    except Exception as e:
+        logger.error(f"[PhotoExtract] ❌ Failed to extract photo: {e}")
         raise
 
 
@@ -477,13 +576,14 @@ def _append_doc(
     """
     nr = needs_review_from_confidence(confidence)
     
-    # PRODUCTION FIX v2.0: Store photos as JPEG images, not PDFs
-    if doc_type == "photos" and image_bytes:
+    # PRODUCTION FIX v2.1: Store photos as JPEG images, not PDFs
+    # Extract embedded images from PDF properly
+    if doc_type == "photos" and pdf_bytes:
         try:
-            # Convert to JPEG for proper image display
-            logger.info(f"[AppendDoc] Photo document detected (page {page_idx}), converting to JPEG...")
-            jpeg_bytes = extract_photo_as_jpeg(image_bytes)
-            logger.info(f"[AppendDoc] ✅ Photo converted successfully: {len(jpeg_bytes)} bytes JPEG")
+            # Extract photo from PDF page (proper embedded image extraction)
+            logger.info(f"[AppendDoc] Photo document detected (page {page_idx}), extracting as JPEG...")
+            jpeg_bytes = extract_photo_from_pdf_page(pdf_bytes, 0)  # Extract from first page of this PDF chunk
+            logger.info(f"[AppendDoc] ✅ Photo extracted successfully: {len(jpeg_bytes)} bytes JPEG")
             
             documents.append({
                 "doc_type": doc_type,
@@ -498,8 +598,8 @@ def _append_doc(
                 "mime_type": "image/jpeg",
             })
         except Exception as e:
-            logger.error(f"[AppendDoc] ❌ Failed to convert photo to JPEG: {e}, falling back to PDF")
-            # Fallback to PDF if JPEG conversion fails
+            logger.error(f"[AppendDoc] ❌ Failed to extract photo as JPEG: {e}, falling back to PDF")
+            # Fallback to PDF if JPEG extraction fails
             documents.append({
                 "doc_type": doc_type,
                 "pages": [page_idx],
