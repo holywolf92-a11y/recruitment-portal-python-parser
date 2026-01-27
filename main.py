@@ -35,7 +35,7 @@ import re
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="CV Parser Service", version="1.0.0")
+app = FastAPI(title="CV Parser Service", version="2.0.0-photo-jpeg")
 
 # CORS middleware
 app.add_middleware(
@@ -497,9 +497,10 @@ async def root():
     """Root endpoint"""
     return {
         "service": "CV Parser",
-        "version": "1.0.0",
+        "version": "2.0.0-photo-jpeg",
         "status": "running",
-        "environment": ENVIRONMENT
+        "environment": ENVIRONMENT,
+        "features": ["jpeg-photo-extraction", "enhanced-logging"]
     }
 
 @app.get("/health")
@@ -507,9 +508,11 @@ async def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
+        "version": "2.0.0-photo-jpeg",
         "timestamp": datetime.utcnow().isoformat(),
         "openai_configured": bool(OPENAI_API_KEY),
-        "hmac_configured": bool(HMAC_SECRET)
+        "hmac_configured": bool(HMAC_SECRET),
+        "photo_jpeg_enabled": True
     }
 
 @app.post("/categorize-document")

@@ -337,18 +337,30 @@ def extract_photo_as_jpeg(img_bytes: bytes) -> bytes:
     Convert image to high-quality JPEG for photo documents.
     This ensures photos are stored as actual images, not PDFs.
     Returns JPEG bytes suitable for direct storage and display.
+    
+    Version: 2.0.0 - Production-grade JPEG extraction
     """
     from PIL import Image
     
-    # Open and convert to RGB (handles PNG with transparency, etc.)
-    pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    
-    # Save as high-quality JPEG
-    buf = io.BytesIO()
-    pil.save(buf, format="JPEG", quality=95, optimize=True)
-    buf.seek(0)
-    
-    return buf.getvalue()
+    try:
+        # Open and convert to RGB (handles PNG with transparency, etc.)
+        pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        
+        # Log image info
+        logger.info(f"[PhotoExtract] Converting image to JPEG: {pil.size[0]}x{pil.size[1]}px, mode={pil.mode}")
+        
+        # Save as high-quality JPEG
+        buf = io.BytesIO()
+        pil.save(buf, format="JPEG", quality=95, optimize=True)
+        buf.seek(0)
+        
+        jpeg_bytes = buf.getvalue()
+        logger.info(f"[PhotoExtract] ✅ Created JPEG: {len(jpeg_bytes)} bytes")
+        
+        return jpeg_bytes
+    except Exception as e:
+        logger.error(f"[PhotoExtract] ❌ Failed to convert image to JPEG: {e}")
+        raise
 
 
 def apply_confidence_gate(category: str, confidence: float) -> tuple[str, float]:
@@ -465,22 +477,41 @@ def _append_doc(
     """
     nr = needs_review_from_confidence(confidence)
     
-    # PRODUCTION FIX: Store photos as JPEG images, not PDFs
+    # PRODUCTION FIX v2.0: Store photos as JPEG images, not PDFs
     if doc_type == "photos" and image_bytes:
-        # Convert to JPEG for proper image display
-        jpeg_bytes = extract_photo_as_jpeg(image_bytes)
-        documents.append({
-            "doc_type": doc_type,
-            "pages": [page_idx],
-            "regions": regions,
-            "confidence": confidence,
-            "identity": identity,
-            "pdf_base64": base64.b64encode(jpeg_bytes).decode("utf-8"),
-            "split_strategy": split_strategy,
-            "needs_review": nr,
-            "is_image": True,  # Flag to indicate this is an image, not a PDF
-            "mime_type": "image/jpeg",
-        })
+        try:
+            # Convert to JPEG for proper image display
+            logger.info(f"[AppendDoc] Photo document detected (page {page_idx}), converting to JPEG...")
+            jpeg_bytes = extract_photo_as_jpeg(image_bytes)
+            logger.info(f"[AppendDoc] ✅ Photo converted successfully: {len(jpeg_bytes)} bytes JPEG")
+            
+            documents.append({
+                "doc_type": doc_type,
+                "pages": [page_idx],
+                "regions": regions,
+                "confidence": confidence,
+                "identity": identity,
+                "pdf_base64": base64.b64encode(jpeg_bytes).decode("utf-8"),
+                "split_strategy": split_strategy,
+                "needs_review": nr,
+                "is_image": True,  # Flag to indicate this is an image, not a PDF
+                "mime_type": "image/jpeg",
+            })
+        except Exception as e:
+            logger.error(f"[AppendDoc] ❌ Failed to convert photo to JPEG: {e}, falling back to PDF")
+            # Fallback to PDF if JPEG conversion fails
+            documents.append({
+                "doc_type": doc_type,
+                "pages": [page_idx],
+                "regions": regions,
+                "confidence": confidence,
+                "identity": identity,
+                "pdf_base64": base64.b64encode(pdf_bytes).decode("utf-8"),
+                "split_strategy": split_strategy,
+                "needs_review": nr,
+                "is_image": False,
+                "mime_type": "application/pdf",
+            })
     else:
         # Standard PDF handling for all other document types
         documents.append({
