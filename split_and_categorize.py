@@ -332,6 +332,25 @@ def image_bytes_to_pdf(img_bytes: bytes) -> bytes:
     return out
 
 
+def extract_photo_as_jpeg(img_bytes: bytes) -> bytes:
+    """
+    Convert image to high-quality JPEG for photo documents.
+    This ensures photos are stored as actual images, not PDFs.
+    Returns JPEG bytes suitable for direct storage and display.
+    """
+    from PIL import Image
+    
+    # Open and convert to RGB (handles PNG with transparency, etc.)
+    pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    
+    # Save as high-quality JPEG
+    buf = io.BytesIO()
+    pil.save(buf, format="JPEG", quality=95, optimize=True)
+    buf.seek(0)
+    
+    return buf.getvalue()
+
+
 def apply_confidence_gate(category: str, confidence: float) -> tuple[str, float]:
     """If confidence < threshold, map to other_documents."""
     if confidence < CONFIDENCE_THRESHOLD:
@@ -438,18 +457,44 @@ def _append_doc(
     page_idx: int,
     regions: list,
     split_strategy: str,
+    image_bytes: bytes | None = None,  # Optional: raw image bytes for photos
 ) -> None:
+    """
+    Append a document to the results list.
+    For 'photos' category, saves as JPEG instead of PDF for proper display.
+    """
     nr = needs_review_from_confidence(confidence)
-    documents.append({
-        "doc_type": doc_type,
-        "pages": [page_idx],
-        "regions": regions,
-        "confidence": confidence,
-        "identity": identity,
-        "pdf_base64": base64.b64encode(pdf_bytes).decode("utf-8"),
-        "split_strategy": split_strategy,
-        "needs_review": nr,
-    })
+    
+    # PRODUCTION FIX: Store photos as JPEG images, not PDFs
+    if doc_type == "photos" and image_bytes:
+        # Convert to JPEG for proper image display
+        jpeg_bytes = extract_photo_as_jpeg(image_bytes)
+        documents.append({
+            "doc_type": doc_type,
+            "pages": [page_idx],
+            "regions": regions,
+            "confidence": confidence,
+            "identity": identity,
+            "pdf_base64": base64.b64encode(jpeg_bytes).decode("utf-8"),
+            "split_strategy": split_strategy,
+            "needs_review": nr,
+            "is_image": True,  # Flag to indicate this is an image, not a PDF
+            "mime_type": "image/jpeg",
+        })
+    else:
+        # Standard PDF handling for all other document types
+        documents.append({
+            "doc_type": doc_type,
+            "pages": [page_idx],
+            "regions": regions,
+            "confidence": confidence,
+            "identity": identity,
+            "pdf_base64": base64.b64encode(pdf_bytes).decode("utf-8"),
+            "split_strategy": split_strategy,
+            "needs_review": nr,
+            "is_image": False,
+            "mime_type": "application/pdf",
+        })
 
 
 async def _process_page_textract_vision(
@@ -503,7 +548,7 @@ async def _process_page_textract_vision(
             identity["nationality"] = "Pakistani"
         
         pdf_one = extract_pages_as_pdf_bytes(pdf_bytes, [page_idx]) if is_pdf and pdf_bytes else image_bytes_to_pdf(img_bytes)
-        _append_doc(documents, doc_type, conf, identity, pdf_one, page_idx, [], "page")
+        _append_doc(documents, doc_type, conf, identity, pdf_one, page_idx, [], "page", image_bytes=img_bytes)
         return
 
     for ri, reg in enumerate(regions):
@@ -533,7 +578,7 @@ async def _process_page_textract_vision(
             identity["nationality"] = "Pakistani"
         
         pdf_one = image_bytes_to_pdf(cropped)
-        _append_doc(documents, doc_type, conf, identity, pdf_one, page_idx, [reg], "region")
+        _append_doc(documents, doc_type, conf, identity, pdf_one, page_idx, [reg], "region", image_bytes=cropped)
 
 
 async def _process_page_vision_only(
@@ -571,7 +616,7 @@ async def _process_page_vision_only(
             identity["nationality"] = "Pakistani"
         
         pdf_one = extract_pages_as_pdf_bytes(pdf_bytes, [page_idx]) if is_pdf and pdf_bytes else image_bytes_to_pdf(img_bytes)
-        _append_doc(documents, doc_type, conf, identity, pdf_one, page_idx, [], "page")
+        _append_doc(documents, doc_type, conf, identity, pdf_one, page_idx, [], "page", image_bytes=img_bytes)
         return
 
     # Multi-region: validate bands (min height, non-overlapping), crop each, optional 2nd Vision pass
@@ -596,7 +641,7 @@ async def _process_page_vision_only(
             identity["nationality"] = "Pakistani"
         
         pdf_one = extract_pages_as_pdf_bytes(pdf_bytes, [page_idx]) if is_pdf and pdf_bytes else image_bytes_to_pdf(img_bytes)
-        _append_doc(documents, doc_type, conf, identity, pdf_one, page_idx, [], "page")
+        _append_doc(documents, doc_type, conf, identity, pdf_one, page_idx, [], "page", image_bytes=img_bytes)
         return
 
     for band in bands:
@@ -627,7 +672,7 @@ async def _process_page_vision_only(
         
         pdf_one = image_bytes_to_pdf(cropped)
         reg = {"left": 0, "top": band["top_pct"], "width": 1.0, "height": band["height_pct"]}
-        _append_doc(documents, rdoc_type, rconf, ridentity, pdf_one, page_idx, [reg], "region")
+        _append_doc(documents, rdoc_type, rconf, ridentity, pdf_one, page_idx, [reg], "region", image_bytes=cropped)
 
 
 async def run_split_and_categorize(
