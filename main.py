@@ -120,7 +120,7 @@ def check_supabase_credentials():
 
         # Quick storage access test
         try:
-                client = create_client(SUPABASE_URL_FOR_CLIENT, SUPABASE_SERVICE_ROLE_KEY)
+            client = create_client(SUPABASE_URL_FOR_CLIENT, SUPABASE_SERVICE_ROLE_KEY)
             # Attempt to list the root of the documents bucket
             try:
                 _ = client.storage.from_('documents').list(limit=1)
