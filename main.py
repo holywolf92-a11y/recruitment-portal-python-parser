@@ -123,7 +123,7 @@ def check_supabase_credentials():
             client = create_client(SUPABASE_URL_FOR_CLIENT, SUPABASE_SERVICE_ROLE_KEY)
             # Attempt to list the root of the documents bucket
             try:
-                _ = client.storage.from_('documents').list(limit=1)
+                _ = client.storage.from_('documents').list()
                 logger.info('[STARTUP] Supabase storage access OK (documents bucket)')
             except Exception as se:
                 logger.error(f"[STARTUP] Supabase storage access FAILED: {se}")
