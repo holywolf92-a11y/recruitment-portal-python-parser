@@ -53,6 +53,15 @@ ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
+# Normalize SUPABASE_URL for storage3 client which expects a trailing slash
+# Keep a clean version without trailing slash for public URL generation
+if SUPABASE_URL:
+    SUPABASE_URL_CLEAN = SUPABASE_URL.rstrip('/')
+    SUPABASE_URL_FOR_CLIENT = SUPABASE_URL_CLEAN + '/'
+else:
+    SUPABASE_URL_CLEAN = SUPABASE_URL
+    SUPABASE_URL_FOR_CLIENT = SUPABASE_URL
+
 if not HMAC_SECRET:
     raise ValueError("PYTHON_HMAC_SECRET environment variable is required")
 
@@ -91,6 +100,37 @@ def verify_hmac(signature: str, body: bytes) -> bool:
     except Exception as e:
         logger.error(f"HMAC verification error: {e}")
         return False
+
+
+@app.on_event("startup")
+def check_supabase_credentials():
+    """Startup check: verify Supabase env and storage access (partial key logged)."""
+    try:
+        if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+            logger.warning("[STARTUP] Supabase env vars missing: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
+            return
+
+        # Log partial key for debugging (do not log full key in production)
+        try:
+            short_key = SUPABASE_SERVICE_ROLE_KEY
+            logger.info(f"[STARTUP] SUPABASE_URL={SUPABASE_URL}")
+            logger.info(f"[STARTUP] SUPABASE_SERVICE_ROLE_KEY={short_key[:6]}...{short_key[-6:]}")
+        except Exception:
+            logger.info("[STARTUP] Supabase key partially available")
+
+        # Quick storage access test
+        try:
+                client = create_client(SUPABASE_URL_FOR_CLIENT, SUPABASE_SERVICE_ROLE_KEY)
+            # Attempt to list the root of the documents bucket
+            try:
+                _ = client.storage.from_('documents').list(limit=1)
+                logger.info('[STARTUP] Supabase storage access OK (documents bucket)')
+            except Exception as se:
+                logger.error(f"[STARTUP] Supabase storage access FAILED: {se}")
+        except Exception as e:
+            logger.error(f"[STARTUP] Failed to initialize Supabase client: {e}")
+    except Exception as e:
+        logger.error(f"[STARTUP] Unexpected error during Supabase credential check: {e}")
 
 async def categorize_document_with_ai(content: str, filename: str, candidate_data: dict = None) -> dict:
     """Categorize document and extract identity fields using OpenAI"""
@@ -1032,42 +1072,32 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
     try:
         # Open PDF with PyMuPDF
         pdf_document = fitz.open(stream=pdf_content, filetype="pdf")
-        
         if pdf_document.page_count == 0:
-            logger.info(f"[PhotoExtraction] PDF has no pages for attachment {attachment_id}")
+            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} file=PDF images_found=0 action=SKIPPED_NO_PAGE")
             return None
-        
-        logger.info(f"[PhotoExtraction] PDF has {pdf_document.page_count} pages")
-        
         # Check first page only (profile photos are usually on page 1)
         first_page = pdf_document[0]
         image_list = first_page.get_images(full=True)
-        
-        logger.info(f"[PhotoExtraction] Found {len(image_list)} images on first page")
-        
+        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} file=PDF images_found={len(image_list)}")
         if not image_list:
-            logger.info(f"[PhotoExtraction] No images found in PDF first page for {attachment_id}")
+            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} file=PDF images_found=0 action=SKIPPED_NO_IMAGE")
             return None
-        
-        # Find largest image (likely the profile photo)
+        # Find largest valid image (jpg, jpeg, png, webp)
+        allowed_exts = {"jpg", "jpeg", "png", "webp"}
         largest_image = None
         largest_size = 0
         all_sizes = []
-        
         for img_index, img_info in enumerate(image_list):
             xref = img_info[0]
             base_image = pdf_document.extract_image(xref)
             image_bytes = base_image["image"]
-            image_ext = base_image["ext"]
-            
-            # Calculate image size
+            image_ext = base_image["ext"].lower()
             image_size = len(image_bytes)
             all_sizes.append((image_size, image_ext))
-            
-            logger.info(f"[PhotoExtraction] Image {img_index}: {image_size} bytes ({image_ext})")
-            
-            # Profile photos are typically 5KB-1MB (relaxed from 10KB-500KB)
-            # Skip very small images (icons/logos) and very large images (full-page scans)
+            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} size={image_size} ext={image_ext}")
+            if image_ext not in allowed_exts:
+                logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} ext={image_ext} action=SKIPPED_UNSUPPORTED_FORMAT")
+                continue
             if 5000 < image_size < 1000000 and image_size > largest_size:
                 largest_image = {
                     "bytes": image_bytes,
@@ -1075,34 +1105,26 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
                     "size": image_size
                 }
                 largest_size = image_size
-                logger.info(f"[PhotoExtraction] Selected image {img_index} as potential profile photo ({image_size} bytes)")
-        
+                logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} action=SELECTED_PROFILE_PHOTO area={image_size}")
         pdf_document.close()
-        
         if not largest_image:
-            logger.info(f"[PhotoExtraction] No suitable profile photo found. Images found: {all_sizes}")
+            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} file=PDF images_found={len(image_list)} action=SKIPPED_NO_VALID_IMAGE all_sizes={all_sizes}")
             return None
-        
-        logger.info(f"[PhotoExtraction] Uploading profile photo ({largest_image['size']} bytes)")
-        
-        # Upload to Supabase Storage
+        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} uploading profile photo size={largest_image['size']} ext={largest_image['ext']}")
         photo_url = upload_photo_to_supabase(
             largest_image["bytes"],
             attachment_id,
             largest_image["ext"]
         )
-        
         if photo_url:
-            logger.info(f"[PhotoExtraction] Successfully extracted and uploaded profile photo: {photo_url}")
+            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} uploaded_as={photo_url}")
         else:
-            logger.warning(f"[PhotoExtraction] Photo extracted but upload returned None")
-        
+            logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} upload_failed action=UPLOAD_ERROR")
         return photo_url
-        
     except Exception as e:
-        logger.warning(f"[PhotoExtraction] Photo extraction failed (non-critical): {e}")
+        logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} extraction_failed error={e}")
         import traceback
-        logger.warning(f"[PhotoExtraction] Traceback: {traceback.format_exc()}")
+        logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} traceback={traceback.format_exc()}")
         return None  # Graceful fallback - don't fail CV parsing if photo extraction fails
 
 def upload_photo_to_supabase(image_bytes: bytes, attachment_id: str, file_ext: str) -> str:
@@ -1113,7 +1135,7 @@ def upload_photo_to_supabase(image_bytes: bytes, attachment_id: str, file_ext: s
             return None
         
         logger.info(f"[PhotoUpload] Initializing Supabase client...")
-        supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+        supabase = create_client(SUPABASE_URL_FOR_CLIENT, SUPABASE_SERVICE_ROLE_KEY)
         
         # Bucket and file path
         bucket_name = "documents"
@@ -1127,8 +1149,8 @@ def upload_photo_to_supabase(image_bytes: bytes, attachment_id: str, file_ext: s
         
         logger.info(f"[PhotoUpload] Upload response: {response}")
         
-        # Return public URL
-        public_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket_name}/{file_path}"
+        # Return public URL (use clean URL without trailing slash)
+        public_url = f"{SUPABASE_URL_CLEAN}/storage/v1/object/public/{bucket_name}/{file_path}"
         logger.info(f"[PhotoUpload] Success! Public URL: {public_url}")
         return public_url
         
