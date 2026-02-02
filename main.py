@@ -442,6 +442,33 @@ Return only the JSON object, no explanation.
                 else:
                     parsed_data['position'] = 'Driver'
                 logger.info(f"Normalized position from '{position}' to '{parsed_data['position']}'")
+
+        # Post-processing: Normalize education list into a readable string
+        education_entries = parsed_data.get('education')
+        if isinstance(education_entries, list):
+            formatted_education = []
+            for edu in education_entries:
+                if not isinstance(edu, dict):
+                    continue
+                degree = (edu.get('degree') or '').strip()
+                institution = (edu.get('institution') or '').strip()
+                graduation_date = (edu.get('graduation_date') or '').strip()
+                location = (edu.get('location') or '').strip()
+
+                parts = []
+                if degree:
+                    parts.append(degree)
+                if institution:
+                    parts.append(institution)
+                if location:
+                    parts.append(location)
+                if graduation_date:
+                    parts.append(f"{graduation_date}")
+
+                if parts:
+                    formatted_education.append(' - '.join(parts))
+
+            parsed_data['education'] = ' | '.join(formatted_education) if formatted_education else None
         
         # Post-processing: Calculate GCC years from work experience
         gcc_countries = ['saudi arabia', 'uae', 'united arab emirates', 'qatar', 'kuwait', 
@@ -492,10 +519,31 @@ Return only the JSON object, no explanation.
 
         # Post-processing: Calculate total experience_years from work experience timeline
         total_experience_years = 0
+        non_experience_keywords = [
+            'intern', 'internship', 'trainee', 'training', 'course', 'certification',
+            'certificate', 'workshop', 'seminar', 'student', 'coursework'
+        ]
         if isinstance(experience_array, list):
             for exp in experience_array:
                 if not isinstance(exp, dict):
                     continue
+                title = (exp.get('title') or '').lower()
+                company = (exp.get('company') or '').lower()
+                description = (exp.get('description') or '').lower()
+
+                # Skip internships, training, and courses from total experience
+                if any(k in title for k in non_experience_keywords) or \
+                   any(k in company for k in non_experience_keywords) or \
+                   any(k in description for k in non_experience_keywords):
+                    # If it's a course/training, add to certifications list
+                    cert_title = exp.get('title') or exp.get('company') or None
+                    if cert_title:
+                        certifications = parsed_data.get('certifications') or []
+                        if isinstance(certifications, list) and cert_title not in certifications:
+                            certifications.append(cert_title)
+                            parsed_data['certifications'] = certifications
+                    continue
+
                 start_date = exp.get('start_date')
                 end_date = exp.get('end_date') or 'Present'
 
