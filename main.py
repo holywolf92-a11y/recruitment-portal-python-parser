@@ -233,10 +233,12 @@ Return ONLY valid JSON:
             existing_certifications = []
         
         internship_keywords = [
-            'intern', 'internship', 'trainee', 'training'
+            'intern', 'internship', 'internee', 'trainee', 'training', 'apprentice'
         ]
         course_keywords = [
-            'course', 'certification', 'certificate', 'workshop', 'seminar', 'student', 'coursework'
+            'course', 'certification', 'certificate', 'workshop', 'seminar', 
+            'student', 'coursework', 'online course', 'certification program',
+            'diploma', 'certification course', 'professional course', 'training program'
         ]
         
         filtered_experience = []
@@ -251,16 +253,19 @@ Return ONLY valid JSON:
                 title = (exp.get('title') or '').lower()
                 company = (exp.get('company') or '').lower()
                 description = (exp.get('description') or '').lower()
+                full_text = f"{title} {company} {description}".lower()
 
                 # Check if this is an internship
                 is_internship = any(k in title for k in internship_keywords) or \
                                any(k in company for k in internship_keywords) or \
                                any(k in description for k in internship_keywords)
                 
-                # Check if this is a course/training
-                is_course = any(k in title for k in course_keywords) or \
-                           any(k in company for k in course_keywords) or \
-                           any(k in description for k in course_keywords)
+                # Check if this is a course/training - check for multi-word keywords too
+                is_course = False
+                for keyword in course_keywords:
+                    if keyword in full_text:
+                        is_course = True
+                        break
 
                 # Handle internships and courses separately
                 if is_internship:
@@ -268,7 +273,15 @@ Return ONLY valid JSON:
                     if internship_title not in internships_list:
                         internships_list.append(internship_title)
                 elif is_course:
-                    cert_title = exp.get('title') or exp.get('company') or None
+                    # Build cert title - prefer full entry or title+company combination
+                    cert_title = None
+                    if exp.get('title'):
+                        cert_title = exp.get('title')
+                        if exp.get('company') and exp.get('company') not in cert_title:
+                            cert_title = f"{cert_title} ({exp.get('company')})"
+                    else:
+                        cert_title = exp.get('company')
+                    
                     if cert_title and cert_title not in existing_certifications:
                         existing_certifications.append(cert_title)
                 else:
@@ -454,6 +467,18 @@ IMPORTANT Guidelines:
 - Be thorough in skills extraction - don't miss any mentioned abilities
 - Pay special attention to the "PERSONAL INFORMATION" or "Personal Details" section for identity fields
 
+CERTIFICATIONS EXTRACTION RULES (CRITICAL):
+- EXTRACT certifications from MULTIPLE sources:
+  1. Dedicated "CERTIFICATIONS" or "CERTIFICATES" sections
+  2. "ONLINE COURSES", "ONLINE CERTIFICATIONS", "COURSERA", "UDEMY", "LINKEDIN LEARNING" sections
+  3. Professional certifications like "PMP", "AWS", "Azure", "CCNA", "IELTS", etc.
+  4. Any mention of courses, training programs, workshops, seminars (NOT work experience roles)
+- Format: Include course/certification name AND provider/organization if available (e.g., "Power System Modelling and Fault Analysis (L&T EduTech)")
+- Include dates/years when available
+- Keep as complete strings in the certifications array (do NOT break into separate fields)
+- CRITICAL: Do NOT include work experience roles in certifications - only actual learning/training activities
+- If a section is labeled "ONLINE COURSES" or "COURSERA COURSES", extract ALL items from that section into certifications
+
 EDUCATION EXTRACTION RULES (CRITICAL):
 - ALWAYS extract education even if formatting is unusual
 - Look for sections labeled: "EDUCATION", "ACADEMIC", "QUALIFICATION", "ACADEMIC BACKGROUND", "EDUCATIONAL BACKGROUND"
@@ -464,6 +489,14 @@ EDUCATION EXTRACTION RULES (CRITICAL):
 - CGPA/GPA often in format: "CGPA: 3.01/4.00", "GPA: 3.5/4.0"
 - If education section exists but is unclear, extract whatever text is present rather than returning empty array
 - NEVER return empty education array if any education text is visible in CV
+
+INTERNSHIPS EXTRACTION RULES (IMPORTANT):
+- EXTRACT internships from "INTERNSHIPS", "INTERNSHIP EXPERIENCE", "TRAINEE POSITIONS", "PROFESSIONAL TRAINING" sections
+- Look for keywords: "Intern", "Internee", "Trainee", "Training", "Apprentice"
+- Include internship title, company/organization, dates, and description
+- CRITICAL: Do NOT include paid work experience (full-time/part-time jobs) in internships - ONLY unpaid/learning roles
+- Distinction: If role has "Intern", "Internee", "Trainee", or "Training" in title/company → internship; otherwise → previous_employment
+- Format in experience array as regular experience entries, they will be filtered to internships array in post-processing
 
 CV Content:
 {content[:4000]}
