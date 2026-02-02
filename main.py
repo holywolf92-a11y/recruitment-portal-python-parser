@@ -574,6 +574,20 @@ def post_process_cv_parsed_data(parsed_data: dict) -> dict:
 
     return parsed_data
 
+def looks_placeholder_cv(parsed_data: dict) -> bool:
+    full_name = (parsed_data.get('full_name') or '').strip().lower()
+    email = (parsed_data.get('email') or '').strip().lower()
+    phone = (parsed_data.get('phone') or '').strip()
+
+    if full_name in {'john doe', 'jane doe'}:
+        return True
+    if email.endswith('@example.com') or email.startswith('test@'):
+        return True
+    digits = ''.join(ch for ch in phone if ch.isdigit())
+    if digits == '1234567890':
+        return True
+    return False
+
 async def parse_cv_with_openai(content: str, filename: str) -> dict:
     """Parse CV content using OpenAI"""
     try:
@@ -1135,12 +1149,19 @@ async def parse_cv_from_url(
         # Extract profile photo (non-blocking - won't fail if extraction fails)
         profile_photo_url = extract_profile_photo_from_pdf(file_content, attachment_id or "unknown")
         
-        # Parse with OpenAI (fallback to Vision when text extraction is weak)
+        # Parse with OpenAI (fallback to Vision when text extraction is weak or placeholder detected)
+        used_vision = False
         if len(text_content.strip()) < 200:
             logger.warning(f"[CVParse] Low text extracted ({len(text_content)} chars). Using Vision parsing.")
             parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
+            used_vision = True
         else:
             parsed_data = await parse_cv_with_openai(text_content, attachment_id or "unknown")
+
+        if not used_vision and looks_placeholder_cv(parsed_data):
+            logger.warning("[CVParse] Placeholder data detected. Retrying with Vision parsing.")
+            parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
+            used_vision = True
         
         # Add profile photo URL to parsed data if extracted
         if profile_photo_url:
