@@ -489,6 +489,53 @@ Return only the JSON object, no explanation.
         if gcc_years > 0:
             parsed_data['gcc_years'] = gcc_years
             logger.info(f"Calculated GCC years: {gcc_years} from work experience")
+
+        # Post-processing: Calculate total experience_years from work experience timeline
+        total_experience_years = 0
+        if isinstance(experience_array, list):
+            for exp in experience_array:
+                if not isinstance(exp, dict):
+                    continue
+                start_date = exp.get('start_date')
+                end_date = exp.get('end_date') or 'Present'
+
+                if not start_date:
+                    # No dates available - estimate 1 year for this role
+                    total_experience_years += 1
+                    continue
+
+                try:
+                    start_year = None
+                    end_year = None
+
+                    if '-' in start_date:
+                        start_year = int(start_date.split('-')[0])
+                    elif len(start_date) == 4 and start_date.isdigit():
+                        start_year = int(start_date)
+
+                    if isinstance(end_date, str) and (end_date.lower() == 'present' or end_date.lower() == 'current'):
+                        end_year = datetime.now().year
+                    elif isinstance(end_date, str) and '-' in end_date:
+                        end_year = int(end_date.split('-')[0])
+                    elif isinstance(end_date, str) and len(end_date) == 4 and end_date.isdigit():
+                        end_year = int(end_date)
+
+                    if start_year and end_year:
+                        total_experience_years += max(0, end_year - start_year)
+                    else:
+                        total_experience_years += 1
+                except (ValueError, AttributeError):
+                    total_experience_years += 1
+
+        if total_experience_years > 0:
+            try:
+                existing_experience = float(parsed_data.get('experience_years')) if parsed_data.get('experience_years') is not None else None
+            except (TypeError, ValueError):
+                existing_experience = None
+
+            if existing_experience is None or total_experience_years > existing_experience:
+                parsed_data['experience_years'] = total_experience_years
+                logger.info(f"Calculated total experience_years: {total_experience_years} from work experience")
         
         # Post-processing: Enhance country_of_interest from work experience
         if not parsed_data.get('country_of_interest') or parsed_data.get('country_of_interest') == 'missing':
