@@ -399,10 +399,9 @@ Return ONLY valid JSON:
         logger.error(f"OpenAI categorization error: {e}")
         raise HTTPException(status_code=500, detail=f"Document categorization failed: {str(e)}")
 
-async def parse_cv_with_openai(content: str, filename: str) -> dict:
-    """Parse CV content using OpenAI"""
-    try:
-        prompt = f"""
+def build_cv_prompt(content: str, from_images: bool = False) -> str:
+    content_section = "CV Images are attached." if from_images else f"CV Content:\n{content[:4000]}"
+    return f"""
 You are a CV/Resume parser. Extract structured information from the following CV content.
 Return ONLY valid JSON with these exact fields (use null for missing data):
 
@@ -496,13 +495,89 @@ INTERNSHIPS EXTRACTION RULES (IMPORTANT):
 - Include internship title, company/organization, dates, and description
 - CRITICAL: Do NOT include paid work experience (full-time/part-time jobs) in internships - ONLY unpaid/learning roles
 - Distinction: If role has "Intern", "Internee", "Trainee", or "Training" in title/company → internship; otherwise → previous_employment
-- Format in experience array as regular experience entries, they will be filtered to internships array in post-processing
+Format in experience array as regular experience entries, they will be filtered to internships array in post-processing
 
-CV Content:
-{content[:4000]}
+{content_section}
 
 Return only the JSON object, no explanation.
 """
+
+def post_process_cv_parsed_data(parsed_data: dict) -> dict:
+    # Post-processing: Move courses from experience to certifications BEFORE normalization
+    experience_array = parsed_data.get('experience', [])
+    existing_certifications = parsed_data.get('certifications', [])
+    if not isinstance(existing_certifications, list):
+        existing_certifications = []
+    
+    internship_keywords = [
+        'intern', 'internship', 'internee', 'trainee', 'training', 'apprentice'
+    ]
+    course_keywords = [
+        'course', 'certification', 'certificate', 'workshop', 'seminar', 
+        'student', 'coursework', 'online course', 'certification program',
+        'diploma', 'certification course', 'professional course', 'training program'
+    ]
+    
+    filtered_experience = []
+    internships_list = []
+    
+    if isinstance(experience_array, list):
+        for exp in experience_array:
+            if not isinstance(exp, dict):
+                filtered_experience.append(exp)
+                continue
+            
+            title = (exp.get('title') or '').lower()
+            company = (exp.get('company') or '').lower()
+            description = (exp.get('description') or '').lower()
+            full_text = f"{title} {company} {description}".lower()
+
+            # Check if this is an internship
+            is_internship = any(k in title for k in internship_keywords) or \
+                           any(k in company for k in internship_keywords) or \
+                           any(k in description for k in internship_keywords)
+            
+            # Check if this is a course/training - check for multi-word keywords too
+            is_course = False
+            for keyword in course_keywords:
+                if keyword in full_text:
+                    is_course = True
+                    break
+
+            # Handle internships and courses separately
+            if is_internship:
+                internship_title = f"{exp.get('title', 'Internship')} at {exp.get('company', 'Unknown')}"
+                if internship_title not in internships_list:
+                    internships_list.append(internship_title)
+            elif is_course:
+                # Build cert title - prefer full entry or title+company combination
+                cert_title = None
+                if exp.get('title'):
+                    cert_title = exp.get('title')
+                    if exp.get('company') and exp.get('company') not in cert_title:
+                        cert_title = f"{cert_title} ({exp.get('company')})"
+                else:
+                    cert_title = exp.get('company')
+                
+                if cert_title and cert_title not in existing_certifications:
+                    existing_certifications.append(cert_title)
+            else:
+                # Keep real work experience
+                filtered_experience.append(exp)
+    
+    # Update parsed_data with cleaned experience and certifications
+    parsed_data['experience'] = filtered_experience
+    if existing_certifications:
+        parsed_data['certifications'] = existing_certifications
+    if internships_list:
+        parsed_data['internships'] = internships_list
+
+    return parsed_data
+
+async def parse_cv_with_openai(content: str, filename: str) -> dict:
+    """Parse CV content using OpenAI"""
+    try:
+        prompt = build_cv_prompt(content, from_images=False)
 
         response = openai.chat.completions.create(
             model="gpt-4o-mini",
@@ -526,6 +601,7 @@ Return only the JSON object, no explanation.
 
         result_text = result_text.strip()
         parsed_data = json.loads(result_text)
+        parsed_data = post_process_cv_parsed_data(parsed_data)
         
         # Post-processing: Normalize driver positions
         position = parsed_data.get('position', '').strip() if parsed_data.get('position') else ''
@@ -762,6 +838,63 @@ Return only the JSON object, no explanation.
     except Exception as e:
         logger.error(f"OpenAI parsing error: {e}")
         raise HTTPException(status_code=500, detail=f"CV parsing failed: {str(e)}")
+
+async def parse_cv_with_vision(file_content: bytes, filename: str, max_pages: int = 2) -> dict:
+    """Parse CV using OpenAI Vision when text extraction is insufficient"""
+    try:
+        import base64
+        images = []
+
+        pdf_doc = fitz.open(stream=file_content, filetype="pdf")
+        pages_to_render = max(1, min(max_pages, len(pdf_doc)))
+
+        for page_index in range(pages_to_render):
+            page = pdf_doc[page_index]
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            img_bytes = pix.tobytes("png")
+            img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+            images.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{img_base64}"}
+            })
+            logger.info(f"[CVVision] Rendered page {page_index + 1} for vision parsing")
+
+        pdf_doc.close()
+
+        if not images:
+            raise HTTPException(status_code=400, detail="No pages found in PDF for vision parsing")
+
+        prompt = build_cv_prompt("", from_images=True)
+
+        response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are a precise CV parser that returns only valid JSON."},
+                {"role": "user", "content": [{"type": "text", "text": prompt}, *images]},
+            ],
+            temperature=0.1,
+            max_tokens=2000,
+        )
+
+        result_text = response.choices[0].message.content.strip()
+
+        # Remove markdown code blocks if present
+        if result_text.startswith("```json"):
+            result_text = result_text[7:]
+        if result_text.startswith("```"):
+            result_text = result_text[3:]
+        if result_text.endswith("```"):
+            result_text = result_text[:-3]
+
+        result_text = result_text.strip()
+        parsed_data = json.loads(result_text)
+        parsed_data = post_process_cv_parsed_data(parsed_data)
+
+        return parsed_data
+
+    except Exception as e:
+        logger.error(f"OpenAI vision parsing error: {e}")
+        raise HTTPException(status_code=500, detail=f"CV vision parsing failed: {str(e)}")
 
 @app.get("/")
 async def root():
@@ -1002,8 +1135,12 @@ async def parse_cv_from_url(
         # Extract profile photo (non-blocking - won't fail if extraction fails)
         profile_photo_url = extract_profile_photo_from_pdf(file_content, attachment_id or "unknown")
         
-        # Parse with OpenAI
-        parsed_data = await parse_cv_with_openai(text_content, attachment_id or "unknown")
+        # Parse with OpenAI (fallback to Vision when text extraction is weak)
+        if len(text_content.strip()) < 200:
+            logger.warning(f"[CVParse] Low text extracted ({len(text_content)} chars). Using Vision parsing.")
+            parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
+        else:
+            parsed_data = await parse_cv_with_openai(text_content, attachment_id or "unknown")
         
         # Add profile photo URL to parsed data if extracted
         if profile_photo_url:
