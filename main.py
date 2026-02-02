@@ -225,7 +225,64 @@ Return ONLY valid JSON:
 
         result_text = result_text.strip()
         parsed_data = json.loads(result_text)
-        # Ensure required fields are present and correct type
+        
+        # Post-processing: Move courses from experience to certifications BEFORE normalization
+        experience_array = parsed_data.get('experience', [])
+        existing_certifications = parsed_data.get('certifications', [])
+        if not isinstance(existing_certifications, list):
+            existing_certifications = []
+        
+        internship_keywords = [
+            'intern', 'internship', 'trainee', 'training'
+        ]
+        course_keywords = [
+            'course', 'certification', 'certificate', 'workshop', 'seminar', 'student', 'coursework'
+        ]
+        
+        filtered_experience = []
+        internships_list = []
+        
+        if isinstance(experience_array, list):
+            for exp in experience_array:
+                if not isinstance(exp, dict):
+                    filtered_experience.append(exp)
+                    continue
+                
+                title = (exp.get('title') or '').lower()
+                company = (exp.get('company') or '').lower()
+                description = (exp.get('description') or '').lower()
+
+                # Check if this is an internship
+                is_internship = any(k in title for k in internship_keywords) or \
+                               any(k in company for k in internship_keywords) or \
+                               any(k in description for k in internship_keywords)
+                
+                # Check if this is a course/training
+                is_course = any(k in title for k in course_keywords) or \
+                           any(k in company for k in course_keywords) or \
+                           any(k in description for k in course_keywords)
+
+                # Handle internships and courses separately
+                if is_internship:
+                    internship_title = f"{exp.get('title', 'Internship')} at {exp.get('company', 'Unknown')}"
+                    if internship_title not in internships_list:
+                        internships_list.append(internship_title)
+                elif is_course:
+                    cert_title = exp.get('title') or exp.get('company') or None
+                    if cert_title and cert_title not in existing_certifications:
+                        existing_certifications.append(cert_title)
+                else:
+                    # Keep real work experience
+                    filtered_experience.append(exp)
+        
+        # Update parsed_data with cleaned experience and certifications
+        parsed_data['experience'] = filtered_experience
+        if existing_certifications:
+            parsed_data['certifications'] = existing_certifications
+        if internships_list:
+            parsed_data['internships'] = internships_list
+        
+        # Now validate other fields
         category = parsed_data.get('category') or 'other_documents'
         confidence = parsed_data.get('confidence')
         try:
@@ -581,49 +638,13 @@ Return only the JSON object, no explanation.
             logger.info(f"Calculated GCC years: {gcc_years} from work experience")
 
         # Post-processing: Calculate total experience_years from work experience timeline
+        # Note: experience_array already has courses and internships removed (done early)
         total_experience_years = 0
-        internship_keywords = [
-            'intern', 'internship', 'trainee', 'training'
-        ]
-        course_keywords = [
-            'course', 'certification', 'certificate', 'workshop', 'seminar', 'student', 'coursework'
-        ]
+        experience_array = parsed_data.get('experience', [])
+        
         if isinstance(experience_array, list):
             for exp in experience_array:
                 if not isinstance(exp, dict):
-                    continue
-                title = (exp.get('title') or '').lower()
-                company = (exp.get('company') or '').lower()
-                description = (exp.get('description') or '').lower()
-
-                # Check if this is an internship
-                is_internship = any(k in title for k in internship_keywords) or \
-                               any(k in company for k in internship_keywords) or \
-                               any(k in description for k in internship_keywords)
-                
-                # Check if this is a course/training
-                is_course = any(k in title for k in course_keywords) or \
-                           any(k in company for k in course_keywords) or \
-                           any(k in description for k in course_keywords)
-
-                # Skip internships and courses from total experience
-                if is_internship or is_course:
-                    # If it's an internship, add to internships list
-                    if is_internship:
-                        internship_title = f"{exp.get('title', 'Internship')} at {exp.get('company', 'Unknown')}"
-                        internships = parsed_data.get('internships') or []
-                        if isinstance(internships, list) and internship_title not in internships:
-                            internships.append(internship_title)
-                            parsed_data['internships'] = internships
-                    
-                    # If it's a course/training, add to certifications list
-                    elif is_course:
-                        cert_title = exp.get('title') or exp.get('company') or None
-                        if cert_title:
-                            certifications = parsed_data.get('certifications') or []
-                            if isinstance(certifications, list) and cert_title not in certifications:
-                                certifications.append(cert_title)
-                                parsed_data['certifications'] = certifications
                     continue
 
                 start_date = exp.get('start_date')
