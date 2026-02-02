@@ -366,10 +366,11 @@ Return ONLY valid JSON with these exact fields (use null for missing data):
   ],
   "education": [
     {{
-      "degree": "string",
-      "institution": "string",
-      "location": "string or null",
-      "graduation_date": "string or null"
+      "degree": "string (REQUIRED - e.g., 'BS Electrical Engineering', 'Bachelor of Science', 'Intermediate', 'Matric', 'Diploma')",
+      "institution": "string (REQUIRED - full university/college name, e.g., 'COMSATS UNIVERSITY ISLAMABAD')",
+      "location": "string or null (city and country, e.g., 'Abbottabad, Pakistan')",
+      "graduation_date": "string or null (year or date range, e.g., '2020-2024', '2024', 'Aug 2024')",
+      "cgpa": "string or null (GPA/CGPA if mentioned, e.g., '3.01/4.00', '3.5')"
     }}
   ],
   "certifications": ["array of strings"],
@@ -395,6 +396,17 @@ IMPORTANT Guidelines:
 - For skills, include programming languages, tools, frameworks, soft skills
 - Be thorough in skills extraction - don't miss any mentioned abilities
 - Pay special attention to the "PERSONAL INFORMATION" or "Personal Details" section for identity fields
+
+EDUCATION EXTRACTION RULES (CRITICAL):
+- ALWAYS extract education even if formatting is unusual
+- Look for sections labeled: "EDUCATION", "ACADEMIC", "QUALIFICATION", "ACADEMIC BACKGROUND", "EDUCATIONAL BACKGROUND"
+- Common degree formats: "BS", "B.Sc", "Bachelor of Science", "Masters", "M.Sc", "Intermediate", "Matric", "Diploma", "FSc", "FA"
+- University names often in CAPS or title case (e.g., "COMSATS UNIVERSITY ISLAMABAD", "University of Engineering and Technology")
+- Location usually follows university name (e.g., "Abbottabad, Pakistan", "Lahore, Pakistan")
+- Dates can be: year ranges (2020-2024), single year (2024), or month-year (Aug 2024)
+- CGPA/GPA often in format: "CGPA: 3.01/4.00", "GPA: 3.5/4.0"
+- If education section exists but is unclear, extract whatever text is present rather than returning empty array
+- NEVER return empty education array if any education text is visible in CV
 
 CV Content:
 {content[:4000]}
@@ -445,15 +457,16 @@ Return only the JSON object, no explanation.
 
         # Post-processing: Normalize education list into a readable string
         education_entries = parsed_data.get('education')
-        if isinstance(education_entries, list):
+        if isinstance(education_entries, list) and len(education_entries) > 0:
             formatted_education = []
             for edu in education_entries:
                 if not isinstance(edu, dict):
                     continue
                 degree = (edu.get('degree') or '').strip()
                 institution = (edu.get('institution') or '').strip()
-                graduation_date = (edu.get('graduation_date') or '').strip()
                 location = (edu.get('location') or '').strip()
+                graduation_date = (edu.get('graduation_date') or '').strip()
+                cgpa = (edu.get('cgpa') or '').strip()
 
                 parts = []
                 if degree:
@@ -463,12 +476,62 @@ Return only the JSON object, no explanation.
                 if location:
                     parts.append(location)
                 if graduation_date:
-                    parts.append(f"{graduation_date}")
+                    parts.append(graduation_date)
+                if cgpa:
+                    parts.append(f"CGPA: {cgpa}" if not cgpa.startswith('CGPA') else cgpa)
 
                 if parts:
                     formatted_education.append(' - '.join(parts))
 
             parsed_data['education'] = ' | '.join(formatted_education) if formatted_education else None
+        else:
+            # If education is empty array or not a list, try fallback extraction
+            parsed_data['education'] = None
+            
+            # Fallback: Search for education patterns in original content
+            if not parsed_data.get('education') and content:
+                import re
+                education_keywords = [
+                    r'BS\s+[\w\s]+Engineering',
+                    r'B\.?Sc\.?\s+[\w\s]+',
+                    r'Bachelor\s+of\s+[\w\s]+',
+                    r'Master\s+of\s+[\w\s]+',
+                    r'M\.?Sc\.?\s+[\w\s]+',
+                    r'MBA\s+[\w\s]*',
+                    r'Intermediate\s+[\w\s]*',
+                    r'F\.?Sc\.?\s+[\w\s]*',
+                    r'Matric\s+[\w\s]*',
+                    r'Diploma\s+in\s+[\w\s]+'
+                ]
+                
+                university_keywords = [
+                    r'COMSATS\s+UNIVERSITY[^.\n]*',
+                    r'University\s+of\s+[\w\s]+',
+                    r'Institute\s+of\s+[\w\s]+',
+                    r'College\s+of\s+[\w\s]+'
+                ]
+                
+                found_education = []
+                content_upper = content.upper()
+                
+                # Look for education section
+                if 'EDUCATION' in content_upper or 'ACADEMIC' in content_upper or 'QUALIFICATION' in content_upper:
+                    for keyword_pattern in education_keywords:
+                        matches = re.findall(keyword_pattern, content, re.IGNORECASE)
+                        if matches:
+                            found_education.extend(matches)
+                    
+                    for uni_pattern in university_keywords:
+                        matches = re.findall(uni_pattern, content, re.IGNORECASE)
+                        if matches:
+                            found_education.extend(matches)
+                
+                if found_education:
+                    # Deduplicate and clean
+                    unique_edu = list(set([e.strip() for e in found_education if len(e.strip()) > 5]))
+                    if unique_edu:
+                        parsed_data['education'] = ' | '.join(unique_edu[:3])  # Limit to first 3
+                        logger.info(f"Fallback education extraction found: {parsed_data['education']}")
         
         # Post-processing: Calculate GCC years from work experience
         gcc_countries = ['saudi arabia', 'uae', 'united arab emirates', 'qatar', 'kuwait', 
