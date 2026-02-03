@@ -1453,13 +1453,164 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
         logger.error(f"[PDFExtraction] PDF extraction error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to extract PDF text: {str(e)}")
 
+def is_image_blurry(image: 'cv2.Mat', threshold: float = 100.0) -> bool:
+    """
+    Check if image is blurry using Laplacian variance method.
+    Lower variance = blurrier. Typical threshold: 100.
+    """
+    try:
+        import cv2
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        is_blurry = laplacian_var < threshold
+        logger.info(f"[QUALITY_CHECK] blur_check variance={laplacian_var:.1f} threshold={threshold} is_blurry={is_blurry}")
+        return is_blurry
+    except Exception as e:
+        logger.warning(f"[QUALITY_CHECK] blur_check failed: {e}")
+        return False
+
+def is_image_too_dark_or_bright(image: 'cv2.Mat', dark_threshold: int = 30, bright_threshold: int = 220) -> tuple:
+    """
+    Check if image is too dark or too bright.
+    Returns (is_bad, reason).
+    """
+    try:
+        import cv2
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        mean_brightness = gray.mean()
+        
+        if mean_brightness < dark_threshold:
+            logger.info(f"[QUALITY_CHECK] brightness_check brightness={mean_brightness:.1f} reason=TOO_DARK")
+            return True, "TOO_DARK"
+        if mean_brightness > bright_threshold:
+            logger.info(f"[QUALITY_CHECK] brightness_check brightness={mean_brightness:.1f} reason=TOO_BRIGHT")
+            return True, "TOO_BRIGHT"
+        
+        logger.info(f"[QUALITY_CHECK] brightness_check brightness={mean_brightness:.1f} status=GOOD")
+        return False, "OK"
+    except Exception as e:
+        logger.warning(f"[QUALITY_CHECK] brightness_check failed: {e}")
+        return False, "UNKNOWN"
+
+def detect_photo_region_heuristic(image: 'cv2.Mat') -> Optional[tuple]:
+    """
+    Heuristic: Find likely photo region on document page.
+    
+    Returns:
+        (x, y, w, h, confidence) of most likely photo region, or None
+    
+    Heuristics:
+    - Photo typically in top corners (first 40% of page)
+    - Portrait aspect ratio (0.6-1.2)
+    - Medium size (not too small icon, not full page)
+    """
+    try:
+        import cv2
+        h, w = image.shape[:2]
+        
+        # Search in top 40% of page (where photos usually are)
+        search_region = image[:int(h * 0.4), :]
+        
+        # Find contours
+        gray = cv2.cvtColor(search_region, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        candidates = []
+        for contour in contours:
+            x, y, cw, ch = cv2.boundingRect(contour)
+            area = cw * ch
+            aspect = cw / ch if ch > 0 else 0
+            
+            # Photo-like criteria
+            min_area = 50 * 50  # At least 50x50
+            max_area = int(w * 0.3) ** 2  # Not more than 30% of page width squared
+            is_portrait = 0.6 <= aspect <= 1.2  # Portrait to square
+            
+            if min_area < area < max_area and is_portrait:
+                # Confidence based on how portrait-like it is
+                portrait_score = 1.0 - abs(aspect - 0.9) / 0.3  # Peak at 0.9 aspect
+                portrait_score = max(0.5, portrait_score)
+                candidates.append({
+                    "rect": (x, y, cw, ch),
+                    "confidence": portrait_score,
+                    "area": area
+                })
+        
+        if not candidates:
+            logger.info("[PHOTO_REGION] No photo region detected")
+            return None
+        
+        # Prefer top-left or top-center (most common photo placement)
+        candidates.sort(key=lambda c: (-c["confidence"], c["rect"][0]))
+        best = candidates[0]
+        x, y, cw, ch = best["rect"]
+        
+        logger.info(f"[PHOTO_REGION] Detected at ({x},{y}) size={cw}x{ch} confidence={best['confidence']:.2f}")
+        return (x, y, cw, ch, best["confidence"])
+        
+    except Exception as e:
+        logger.warning(f"[PHOTO_REGION] detection failed: {e}")
+        return None
+
+def detect_faces_with_mediapipe(image: 'cv2.Mat') -> list:
+    """
+    Detect faces using MediaPipe (modern, accurate, handles all angles).
+    
+    Returns:
+        List of (x, y, w, h, confidence) for each detected face
+    """
+    try:
+        import mediapipe as mp
+        
+        # Initialize MediaPipe Face Detection
+        mp_face_detection = mp.solutions.face_detection
+        with mp_face_detection.FaceDetection(
+            model_selection=1,  # 1 = full-range (works on all faces)
+            min_detection_confidence=0.7
+        ) as face_detection:
+            # Convert BGR to RGB
+            import cv2
+            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            results = face_detection.process(rgb_image)
+            
+            faces = []
+            if results.detections:
+                h, w = image.shape[:2]
+                for detection in results.detections:
+                    bbox = detection.location_data.relative_bounding_box
+                    x = int(bbox.xmin * w)
+                    y = int(bbox.ymin * h)
+                    box_w = int(bbox.width * w)
+                    box_h = int(bbox.height * h)
+                    confidence = detection.score[0] if detection.score else 0.5
+                    
+                    # Validate bounds
+                    x = max(0, x)
+                    y = max(0, y)
+                    box_w = min(box_w, w - x)
+                    box_h = min(box_h, h - y)
+                    
+                    if box_w > 0 and box_h > 0:
+                        faces.append((x, y, box_w, box_h, float(confidence)))
+                        logger.info(f"[FACE_DETECT] Face at ({x},{y}) {box_w}x{box_h} confidence={confidence:.2f}")
+            
+            logger.info(f"[FACE_DETECT] MediaPipe found {len(faces)} faces")
+            return faces
+            
+    except Exception as e:
+        logger.warning(f"[FACE_DETECT] MediaPipe failed: {e}")
+        return []
+
 def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Optional[str]:
     """
-    Extract profile photo from PDF and upload to Supabase Storage.
+    Extract profile photo from PDF using best-practice pipeline:
     
-    Strategy:
-    1. For regular PDFs with embedded images: Select small portrait images (likely profile photos)
-    2. For scanned PDFs (entire page is one image): Use face detection to extract the face
+    1. Normalize PDF to images (consistent processing)
+    2. Find photo-like regions (avoid false positives in text/logos)
+    3. Detect faces (MediaPipe - modern, accurate)
+    4. Quality checks (blur, brightness, size)
+    5. Smart cropping and upload
     
     Returns the public URL of the uploaded photo, or None if no photo found.
     """
@@ -1467,150 +1618,112 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
         import cv2
         import numpy as np
         
-        # Open PDF with PyMuPDF
+        # Step 1: Normalize PDF to images at 300 DPI
         pdf_document = fitz.open(stream=pdf_content, filetype="pdf")
         if pdf_document.page_count == 0:
-            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} file=PDF images_found=0 action=SKIPPED_NO_PAGE")
+            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=NO_PAGES")
             return None
-            
+        
+        # Get first page and render at 300 DPI (good quality + reasonable size)
         first_page = pdf_document[0]
-        page_area = first_page.rect.width * first_page.rect.height
-        image_list = first_page.get_images(full=True)
+        pix = first_page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom ≈ 144 DPI
+        img_data = pix.tobytes("png")
         
-        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} file=PDF images_found={len(image_list)}")
-        
-        if not image_list:
-            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} file=PDF images_found=0 action=SKIPPED_NO_IMAGE")
-            pdf_document.close()
-            return None
-        
-        # Analyze images to determine strategy
-        allowed_exts = {"jpg", "jpeg", "png", "webp"}
-        profile_candidates = []
-        
-        for img_index, img_info in enumerate(image_list):
-            xref = img_info[0]
-            base_image = pdf_document.extract_image(xref)
-            image_bytes = base_image["image"]
-            image_ext = base_image["ext"].lower()
-            image_width = base_image["width"]
-            image_height = base_image["height"]
-            image_size = len(image_bytes)
-            
-            if image_ext not in allowed_exts:
-                logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} ext={image_ext} action=SKIPPED_UNSUPPORTED")
-                continue
-            
-            # Calculate aspect ratio and coverage
-            aspect_ratio = image_width / image_height if image_height > 0 else 0
-            img_rects = first_page.get_image_rects(xref)
-            coverage = 0
-            if img_rects:
-                rect = img_rects[0]
-                coverage = (rect.width * rect.height) / page_area
-            
-            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} dims={image_width}x{image_height} size={image_size} ext={image_ext} coverage={coverage:.1%} ratio={aspect_ratio:.2f}")
-            
-            # Score image as profile photo candidate
-            # Profile photos are typically: small, portrait/square, reasonable file size
-            is_small = image_width < 800 and image_height < 800
-            is_portrait = 0.6 <= aspect_ratio <= 1.4  # Portrait to square
-            is_reasonable_size = 5000 < image_size < 200000  # 5KB to 200KB
-            is_low_coverage = coverage < 0.3  # Less than 30% of page
-            
-            if is_small and is_portrait and is_reasonable_size and is_low_coverage:
-                score = 100  # High score for ideal profile photo
-                logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} action=PROFILE_CANDIDATE score={score}")
-                profile_candidates.append({
-                    "bytes": image_bytes,
-                    "ext": image_ext,
-                    "size": image_size,
-                    "score": score
-                })
-            elif coverage > 0.8:
-                # This is a scanned CV (image covers >80% of page) - try face detection
-                logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} coverage={coverage:.1%} action=SCANNED_CV_DETECTED attempting_face_detection")
-                
-                try:
-                    # Convert image to OpenCV format
-                    nparr = np.frombuffer(image_bytes, np.uint8)
-                    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                    
-                    if img is None:
-                        logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} face_detection=FAILED reason=opencv_decode_failed")
-                        continue
-                    
-                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                    
-                    # Use Haar Cascade for face detection
-                    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-                    faces = face_cascade.detectMultiScale(
-                        gray,
-                        scaleFactor=1.1,
-                        minNeighbors=5,
-                        minSize=(80, 80),  # Minimum face size
-                        flags=cv2.CASCADE_SCALE_IMAGE
-                    )
-                    
-                    if len(faces) > 0:
-                        # Get the first (usually best) face
-                        x, y, w, h = faces[0]
-                        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} face_detected at=({x},{y}) size={w}x{h}")
-                        
-                        # Crop face with padding (20% on each side)
-                        padding = int(max(w, h) * 0.2)
-                        x1 = max(0, x - padding)
-                        y1 = max(0, y - padding)
-                        x2 = min(img.shape[1], x + w + padding)
-                        y2 = min(img.shape[0], y + h + padding)
-                        
-                        face_crop = img[y1:y2, x1:x2]
-                        
-                        # Convert back to JPEG bytes
-                        success, buffer = cv2.imencode('.jpg', face_crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                        if success:
-                            face_bytes = buffer.tobytes()
-                            face_size = len(face_bytes)
-                            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} face_extracted size={face_size} dims={(x2-x1)}x{(y2-y1)}")
-                            
-                            profile_candidates.append({
-                                "bytes": face_bytes,
-                                "ext": "jpg",
-                                "size": face_size,
-                                "score": 90  # High score for detected face
-                            })
-                        else:
-                            logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} face_encode_failed")
-                    else:
-                        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} face_detection=NO_FACE_FOUND")
-                        
-                except Exception as face_err:
-                    logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} face_detection_error={face_err}")
-        
+        import io
+        from PIL import Image as PILImage
+        pil_img = PILImage.open(io.BytesIO(img_data))
+        cv_image = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
         pdf_document.close()
         
-        # Select best profile photo candidate
-        if not profile_candidates:
-            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=NO_PROFILE_PHOTO_FOUND total_images={len(image_list)}")
+        h, w = cv_image.shape[:2]
+        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} page_rendered dims={w}x{h}")
+        
+        # Step 2: Find photo-like regions (heuristic)
+        photo_region = detect_photo_region_heuristic(cv_image)
+        
+        # If heuristic found a region, crop it. Otherwise, use full page.
+        if photo_region:
+            x, y, rw, rh, conf = photo_region
+            crop_img = cv_image[y:y+rh, x:x+rw]
+            logger.info(f"[PHOTO_EXTRACT] Using detected photo region")
+        else:
+            # Fall back to full page (e.g., for full-page scans)
+            crop_img = cv_image
+            logger.info(f"[PHOTO_EXTRACT] Using full page (no photo region detected)")
+        
+        # Step 3: Detect faces in crop region
+        faces = detect_faces_with_mediapipe(crop_img)
+        
+        if not faces:
+            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=NO_FACES_DETECTED")
             return None
         
-        # Sort by score (highest first), then by size
-        profile_candidates.sort(key=lambda x: (x["score"], x["size"]), reverse=True)
-        best_photo = profile_candidates[0]
+        # Sort by confidence (highest first)
+        faces.sort(key=lambda f: f[4], reverse=True)
+        best_face = faces[0]
+        x, y, fw, fh, face_conf = best_face
         
-        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} uploading best_candidate score={best_photo['score']} size={best_photo['size']} ext={best_photo['ext']}")
+        # Step 4: Quality checks
+        # 4a. Check if face is reasonable size relative to crop
+        crop_h, crop_w = crop_img.shape[:2]
+        face_area_ratio = (fw * fh) / (crop_w * crop_h)
+        if face_area_ratio < 0.15 or face_area_ratio > 0.8:
+            logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=FACE_SIZE face_ratio={face_area_ratio:.2f}")
+            return None
         
-        photo_url = upload_photo_to_supabase(
-            best_photo["bytes"],
-            attachment_id,
-            best_photo["ext"]
-        )
+        # 4b. Check if image is blurry
+        if is_image_blurry(crop_img, threshold=100):
+            logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=BLURRY")
+            return None
+        
+        # 4c. Check brightness
+        is_bad_brightness, brightness_reason = is_image_too_dark_or_bright(crop_img)
+        if is_bad_brightness:
+            logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason={brightness_reason}")
+            return None
+        
+        # Step 5: Smart cropping (expand face with padding, standardize to square)
+        padding = int(max(fw, fh) * 0.15)  # 15% padding around face
+        x1 = max(0, x - padding)
+        y1 = max(0, y - padding)
+        x2 = min(crop_w, x + fw + padding)
+        y2 = min(crop_h, y + fh + padding)
+        
+        face_crop = crop_img[y1:y2, x1:x2]
+        crop_h_final, crop_w_final = face_crop.shape[:2]
+        
+        # Standardize to square (512x512 is good for avatars)
+        target_size = 512
+        if crop_w_final != crop_h_final:
+            # Pad to square
+            max_dim = max(crop_w_final, crop_h_final)
+            square_img = np.zeros((max_dim, max_dim, 3), dtype=np.uint8)
+            x_offset = (max_dim - crop_w_final) // 2
+            y_offset = (max_dim - crop_h_final) // 2
+            square_img[y_offset:y_offset+crop_h_final, x_offset:x_offset+crop_w_final] = face_crop
+            face_crop = square_img
+        
+        # Resize to target size
+        face_crop = cv2.resize(face_crop, (target_size, target_size), interpolation=cv2.INTER_LANCZOS4)
+        
+        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} face_ready size={target_size}x{target_size} confidence={face_conf:.2f}")
+        
+        # Convert to JPEG bytes
+        success, buffer = cv2.imencode('.jpg', face_crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        if not success:
+            logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=JPEG_ENCODE_FAILED")
+            return None
+        
+        photo_bytes = buffer.tobytes()
+        
+        # Upload to storage
+        photo_url = upload_photo_to_supabase(photo_bytes, attachment_id, "jpg")
         
         if photo_url:
-            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} uploaded_as={photo_url}")
+            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} SUCCESS uploaded_as={photo_url}")
         else:
-            logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} upload_failed action=UPLOAD_ERROR")
-            
+            logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=UPLOAD_FAILED")
+        
         return photo_url
         
     except Exception as e:
