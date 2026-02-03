@@ -1157,12 +1157,10 @@ async def parse_cv_from_url(
         # Extract text from PDF
         text_content = extract_text_from_pdf(file_content)
         
-        # DISABLED: Heuristic photo extraction (Phase A - see PHOTO_EXTRACTION_PHASES.md)
-        # The scipy-based heuristics were extracting text regions instead of faces
-        # Backend AI extraction (OpenAI Vision) will handle photo extraction instead
-        # TODO: Re-enable in Phase C after installing real face detection library
-        # profile_photo_url = extract_profile_photo_from_pdf(file_content, attachment_id or "unknown")
-        profile_photo_url = None  # Temporarily disabled
+        # PHASE C COMPLETE: Real ML-based face detection enabled!  
+        # Using face-recognition library with dlib HOG detector
+        # No more false positives (text regions detected as faces)
+        profile_photo_url = extract_profile_photo_from_pdf(file_content, attachment_id or "unknown")
         
         # Parse with OpenAI (fallback to Vision when text extraction is weak or placeholder detected)
         used_vision = False
@@ -1178,8 +1176,7 @@ async def parse_cv_from_url(
             parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
             used_vision = True
         
-        # Note: profile_photo_url is disabled - backend AI will extract photos instead
-        # (See backend/src/workers/cvParserWorker.ts lines 598-623)
+        # Add profile photo URL to parsed data if extracted
         if profile_photo_url:
             parsed_data['profile_photo_url'] = profile_photo_url
         
@@ -1663,29 +1660,30 @@ def detect_faces_with_mediapipe(image: Image.Image) -> list:
 
 def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Optional[str]:
     """
-    Extract profile photo from PDF using PIL + scipy (no OpenCV needed).
+    Extract profile photo from PDF using face-recognition ML library (Phase C).
     
     Pipeline:
-    1. Normalize PDF to images 
-    2. Find photo-like regions (heuristic)
-    3. Detect face regions (contrast-based)
-    4. Quality checks (blur, brightness)
-    5. Smart cropping and upload
+    1. Render PDF first page to image
+    2. Detect faces using face-recognition (dlib HOG)
+    3. Quality checks (blur, brightness, size)
+    4. Smart cropping and upload
     
-    Returns the public URL of the uploaded photo, or None if no photo found.
+    Returns the signed URL of the uploaded photo, or None if no photo found.
     """
     try:
+        import face_recognition
+        
         logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=START")
         
-        # Step 1: Normalize PDF to images 
+        # Step 1: Render PDF to image
         pdf_document = fitz.open(stream=pdf_content, filetype="pdf")
         if pdf_document.page_count == 0:
             logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=NO_PAGES")
             return None
         
-        # Get first page and render to image
+        # Get first page and render to high-quality image
         first_page = pdf_document[0]
-        pix = first_page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom for quality
+        pix = first_page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom for better detection
         img_data = pix.tobytes("png")
         pil_img = Image.open(io.BytesIO(img_data))
         pdf_document.close()
@@ -1693,142 +1691,74 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
         w, h = pil_img.size
         logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} page_rendered dims={w}x{h}")
         
-        # Step 2: Find photo-like regions (heuristic)
-        photo_region = detect_photo_region_heuristic(pil_img)
-        direct_region_conf: Optional[float] = None
+        # Step 2: Detect faces with real ML (face-recognition library)
+        img_array = np.array(pil_img)
+        face_locations = face_recognition.face_locations(img_array, model="hog")  # HOG is faster, CNN is more accurate
         
-        # If heuristic found a region with high confidence, use it directly
-        # (high confidence region IS the photo/face area)
-        if photo_region:
-            x, y, rw, rh, conf = photo_region
-            crop_img = pil_img.crop((x, y, x+rw, y+rh))
-            logger.info(f"[PHOTO_REGION] Detected at ({x},{y}) size={rw}x{rh} confidence={conf:.2f}")
-            logger.info(f"[PHOTO_EXTRACT] Using detected photo region (confidence={conf:.2f})")
-            
-            # If high confidence, skip additional face detection
-            if conf >= 0.90:
-                logger.info(f"[FACE_DETECT] High confidence region - skipping face detection")
-                direct_region_conf = conf
-            else:
-                # For lower confidence, do additional face detection
-                faces = detect_faces_with_mediapipe(crop_img)
-                if not faces:
-                    logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=LOW_CONFIDENCE_NO_FACES")
-                    return None
-        else:
-            # Fall back to full page + face detection
-            crop_img = pil_img
-            logger.info(f"[PHOTO_EXTRACT] Using full page (no photo region detected)")
-            faces = detect_faces_with_mediapipe(crop_img)
-            
-            if not faces:
-                logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=NO_FACES_DETECTED")
-                return None
-
-        # If we have a high-confidence photo region, treat the region itself as the final avatar.
-        if direct_region_conf is not None:
-            crop_w, crop_h = crop_img.size
-            if crop_w < 80 or crop_h < 80:
-                logger.warning(
-                    f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=REGION_TOO_SMALL dims={crop_w}x{crop_h}"
-                )
-                return None
-
-            if is_image_blurry(crop_img, threshold=100):
-                logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=BLURRY")
-                return None
-
-            is_bad_brightness, brightness_reason = is_image_too_dark_or_bright(crop_img)
-            if is_bad_brightness:
-                logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason={brightness_reason}")
-                return None
-
-            # Standardize to square (512x512 for avatars)
-            target_size = 512
-            avatar_pil = crop_img.convert('RGB')
-            aw, ah = avatar_pil.size
-            if aw != ah:
-                max_dim = max(aw, ah)
-                square_img = Image.new('RGB', (max_dim, max_dim), (255, 255, 255))
-                x_offset = (max_dim - aw) // 2
-                y_offset = (max_dim - ah) // 2
-                square_img.paste(avatar_pil, (x_offset, y_offset))
-                avatar_pil = square_img
-
-            avatar_pil = avatar_pil.resize((target_size, target_size), Image.Resampling.LANCZOS)
-            logger.info(
-                f"[PHOTO_EXTRACT] candidate_id={attachment_id} face_ready size={target_size}x{target_size} confidence={direct_region_conf:.2f}"
-            )
-
-            from io import BytesIO
-            buffer = BytesIO()
-            avatar_pil.save(buffer, format='JPEG', quality=95)
-            photo_bytes = buffer.getvalue()
-
-            photo_url = upload_photo_to_supabase(photo_bytes, attachment_id, "jpg")
-            if photo_url:
-                logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} SUCCESS uploaded_as={photo_url}")
-            else:
-                logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=UPLOAD_FAILED")
-            return photo_url
-        
-        # Sort by confidence (highest first)
-        faces.sort(key=lambda f: f[4], reverse=True)
-        best_face = faces[0]
-        fx, fy, fw, fh, face_conf = best_face
-        
-        # Step 4: Quality checks
-        # 4a. Check if face is reasonable size relative to crop
-        crop_w, crop_h = crop_img.size
-        face_area_ratio = (fw * fh) / (crop_w * crop_h)
-        if face_area_ratio < 0.15 or face_area_ratio > 0.8:
-            logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=FACE_SIZE face_ratio={face_area_ratio:.2f}")
+        if not face_locations:
+            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=NO_FACES_DETECTED")
             return None
         
-        # 4b. Check if image is blurry
-        if is_image_blurry(crop_img, threshold=100):
+        logger.info(f"[FACE_DETECT] Found {len(face_locations)} face(s) using ML")
+        
+        # Get the first (usually largest/best) face
+        # face_locations returns (top, right, bottom, left)
+        top, right, bottom, left = face_locations[0]
+        face_width = right - left
+        face_height = bottom - top
+        
+        logger.info(f"[FACE_DETECT] Best face at ({left},{top}) size={face_width}x{face_height}")
+        
+        # Step 3: Quality checks
+        # 3a. Check face size (reject if too small)
+        if face_width < 80 or face_height < 80:
+            logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=FACE_TOO_SMALL dims={face_width}x{face_height}")
+            return None
+        
+        # 3b. Crop face with padding
+        padding = int(max(face_width, face_height) * 0.20)  # 20% padding
+        x1 = max(0, left - padding)
+        y1 = max(0, top - padding)
+        x2 = min(w, right + padding)
+        y2 = min(h, bottom + padding)
+        
+        face_crop = pil_img.crop((x1, y1, x2, y2))
+        
+        # 3c. Blur check
+        if is_image_blurry(face_crop, threshold=100):
             logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=BLURRY")
             return None
         
-        # 4c. Check brightness
-        is_bad_brightness, brightness_reason = is_image_too_dark_or_bright(crop_img)
+        # 3d. Brightness check
+        is_bad_brightness, brightness_reason = is_image_too_dark_or_bright(face_crop)
         if is_bad_brightness:
             logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason={brightness_reason}")
             return None
         
-        # Step 5: Smart cropping (expand face with padding, standardize to square)
-        padding = int(max(fw, fh) * 0.15)  # 15% padding around face
-        x1 = max(0, fx - padding)
-        y1 = max(0, fy - padding)
-        x2 = min(crop_w, fx + fw + padding)
-        y2 = min(crop_h, fy + fh + padding)
-        
-        face_crop_pil = crop_img.crop((x1, y1, x2, y2))
-        crop_w_final, crop_h_final = face_crop_pil.size
-        
-        # Standardize to square (512x512 for avatars)
+        # Step 4: Standardize to square 512x512
         target_size = 512
-        if crop_w_final != crop_h_final:
-            # Pad to square
-            max_dim = max(crop_w_final, crop_h_final)
+        crop_w, crop_h = face_crop.size
+        
+        if crop_w != crop_h:
+            # Pad to square with white background
+            max_dim = max(crop_w, crop_h)
             square_img = Image.new('RGB', (max_dim, max_dim), (255, 255, 255))
-            x_offset = (max_dim - crop_w_final) // 2
-            y_offset = (max_dim - crop_h_final) // 2
-            square_img.paste(face_crop_pil, (x_offset, y_offset))
-            face_crop_pil = square_img
+            x_offset = (max_dim - crop_w) // 2
+            y_offset = (max_dim - crop_h) // 2
+            square_img.paste(face_crop, (x_offset, y_offset))
+            face_crop = square_img
         
-        # Resize to target size
-        face_crop_pil = face_crop_pil.resize((target_size, target_size), Image.Resampling.LANCZOS)
+        # Resize to 512x512
+        face_crop = face_crop.resize((target_size, target_size), Image.Resampling.LANCZOS)
         
-        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} face_ready size={target_size}x{target_size} confidence={face_conf:.2f}")
+        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} face_ready size={target_size}x{target_size}")
         
-        # Convert to JPEG bytes
-        from io import BytesIO
-        buffer = BytesIO()
-        face_crop_pil.save(buffer, format='JPEG', quality=95)
+        # Step 5: Convert to JPEG and upload
+        buffer = io.BytesIO()
+        face_crop.save(buffer, format='JPEG', quality=95)
         photo_bytes = buffer.getvalue()
         
-        # Upload to storage
+        # Upload to Supabase (will return signed URL)
         photo_url = upload_photo_to_supabase(photo_bytes, attachment_id, "jpg")
         
         if photo_url:
@@ -1838,10 +1768,15 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
         
         return photo_url
         
+    except ImportError as e:
+        logger.warning(f"[PHOTO_EXTRACT] face-recognition library not available: {e}")
+        logger.warning(f"[PHOTO_EXTRACT] Install with: pip install face-recognition dlib")
+        return None
+        
     except Exception as e:
         logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} extraction_failed error={e}")
         import traceback
-        logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} traceback={traceback.format_exc()}")
+        logger.warning(f"[PHOTO_EXTRACT] traceback={traceback.format_exc()}")
         return None  # Graceful fallback - don't fail CV parsing if photo extraction fails
 
 def upload_photo_to_supabase(image_bytes: bytes, attachment_id: str, file_ext: str) -> str:
