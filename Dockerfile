@@ -1,6 +1,5 @@
-# Dockerfile for Railway
-# Using full bullseye image for better compatibility than slim
-FROM python:3.11-bullseye
+# Using python 3.9 which often has better pre-built wheel support for dlib
+FROM python:3.9-bullseye
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
