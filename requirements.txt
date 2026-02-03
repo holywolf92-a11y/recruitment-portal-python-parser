@@ -15,6 +15,8 @@ boto3>=1.28.0
 # IMPORTANT: Use headless OpenCV for server environments (no X11 needed)
 # DO NOT use opencv-python (GUI version requires libxcb)
 opencv-python-headless>=4.8.0
+# Explicitly prevent pip from installing GUI version (which requires libxcb)
+opencv-python==0
 numpy>=1.24.0
 mediapipe>=0.10.0
 scipy>=1.11.0
