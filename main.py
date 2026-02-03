@@ -1691,22 +1691,33 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
         # Step 2: Find photo-like regions (heuristic)
         photo_region = detect_photo_region_heuristic(pil_img)
         
-        # If heuristic found a region, crop it. Otherwise, use full page.
+        # If heuristic found a region with high confidence, use it directly
+        # (high confidence region IS the photo/face area)
         if photo_region:
             x, y, rw, rh, conf = photo_region
             crop_img = pil_img.crop((x, y, x+rw, y+rh))
-            logger.info(f"[PHOTO_EXTRACT] Using detected photo region")
+            logger.info(f"[PHOTO_REGION] Detected at ({x},{y}) size={rw}x{rh} confidence={conf:.2f}")
+            logger.info(f"[PHOTO_EXTRACT] Using detected photo region (confidence={conf:.2f})")
+            
+            # If high confidence, skip additional face detection
+            if conf >= 0.90:
+                logger.info(f"[FACE_DETECT] High confidence region - using directly")
+                faces = True  # Treat region as valid
+            else:
+                # For lower confidence, do additional face detection
+                faces = detect_faces_with_mediapipe(crop_img)
+                if not faces:
+                    logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=LOW_CONFIDENCE_NO_FACES")
+                    return None
         else:
-            # Fall back to full page
+            # Fall back to full page + face detection
             crop_img = pil_img
             logger.info(f"[PHOTO_EXTRACT] Using full page (no photo region detected)")
-        
-        # Step 3: Detect faces in crop region
-        faces = detect_faces_with_mediapipe(crop_img)
-        
-        if not faces:
-            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=NO_FACES_DETECTED")
-            return None
+            faces = detect_faces_with_mediapipe(crop_img)
+            
+            if not faces:
+                logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=NO_FACES_DETECTED")
+                return None
         
         # Sort by confidence (highest first)
         faces.sort(key=lambda f: f[4], reverse=True)
