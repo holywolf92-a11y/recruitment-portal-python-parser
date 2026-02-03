@@ -1,27 +1,41 @@
 # Dockerfile for Railway
-FROM python:3.11-slim
+# Using full bullseye image for better compatibility than slim
+FROM python:3.11-bullseye
 
-# Install system dependencies required for dlib and face-recognition
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
 # cmake, build-essential: required to compile dlib
-# libx11-6, libxext6, libxrender1: X11 libraries required by face_recognition/dlib
-# libgl1-mesa-glx: OpenGL library sometimes required
+# libx11-dev, etc: X11 headers required for dlib GUI support checks
+# libopenblas-dev: Linear algebra libraries for dlib optimization
 RUN apt-get update && apt-get install -y \
     cmake \
     build-essential \
-    libx11-6 \
-    libxext6 \
-    libxrender1 \
+    pkg-config \
+    libx11-dev \
+    libxext-dev \
+    libsm-dev \
+    libxrender-dev \
     libgl1-mesa-glx \
+    libopenblas-dev \
+    liblapack-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
 
-# Copy requirements file
+# Upgrade pip
+RUN pip install --upgrade pip
+
+# Copy and install requirements
 COPY requirements.txt .
 
-# Install Python dependencies
-# --no-cache-dir to keep image size small
+# Install dependencies
+# Using --no-cache-dir to minimize image size
+# Installing dlib explicitly first can help debug if it fails
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application code
