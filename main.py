@@ -1623,8 +1623,7 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
         first_page = pdf_document[0]
         pix = first_page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom ≈ 144 DPI
         img_data = pix.tobytes("png")
-                import io
-        from PIL import Image as PILImage
+        pil_img = PILImage.open(io.BytesIO(img_data))
         pil_img = PILImage.open(io.BytesIO(img_data))
         cv_image = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
         pdf_document.close()
