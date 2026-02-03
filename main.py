@@ -1456,60 +1456,163 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
 def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Optional[str]:
     """
     Extract profile photo from PDF and upload to Supabase Storage.
+    
+    Strategy:
+    1. For regular PDFs with embedded images: Select small portrait images (likely profile photos)
+    2. For scanned PDFs (entire page is one image): Use face detection to extract the face
+    
     Returns the public URL of the uploaded photo, or None if no photo found.
     """
     try:
+        import cv2
+        import numpy as np
+        
         # Open PDF with PyMuPDF
         pdf_document = fitz.open(stream=pdf_content, filetype="pdf")
         if pdf_document.page_count == 0:
             logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} file=PDF images_found=0 action=SKIPPED_NO_PAGE")
             return None
-        # Check first page only (profile photos are usually on page 1)
+            
         first_page = pdf_document[0]
+        page_area = first_page.rect.width * first_page.rect.height
         image_list = first_page.get_images(full=True)
+        
         logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} file=PDF images_found={len(image_list)}")
+        
         if not image_list:
             logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} file=PDF images_found=0 action=SKIPPED_NO_IMAGE")
+            pdf_document.close()
             return None
-        # Find largest valid image (jpg, jpeg, png, webp)
+        
+        # Analyze images to determine strategy
         allowed_exts = {"jpg", "jpeg", "png", "webp"}
-        largest_image = None
-        largest_size = 0
-        all_sizes = []
+        profile_candidates = []
+        
         for img_index, img_info in enumerate(image_list):
             xref = img_info[0]
             base_image = pdf_document.extract_image(xref)
             image_bytes = base_image["image"]
             image_ext = base_image["ext"].lower()
+            image_width = base_image["width"]
+            image_height = base_image["height"]
             image_size = len(image_bytes)
-            all_sizes.append((image_size, image_ext))
-            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} size={image_size} ext={image_ext}")
+            
             if image_ext not in allowed_exts:
-                logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} ext={image_ext} action=SKIPPED_UNSUPPORTED_FORMAT")
+                logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} ext={image_ext} action=SKIPPED_UNSUPPORTED")
                 continue
-            if 5000 < image_size < 1000000 and image_size > largest_size:
-                largest_image = {
+            
+            # Calculate aspect ratio and coverage
+            aspect_ratio = image_width / image_height if image_height > 0 else 0
+            img_rects = first_page.get_image_rects(xref)
+            coverage = 0
+            if img_rects:
+                rect = img_rects[0]
+                coverage = (rect.width * rect.height) / page_area
+            
+            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} dims={image_width}x{image_height} size={image_size} ext={image_ext} coverage={coverage:.1%} ratio={aspect_ratio:.2f}")
+            
+            # Score image as profile photo candidate
+            # Profile photos are typically: small, portrait/square, reasonable file size
+            is_small = image_width < 800 and image_height < 800
+            is_portrait = 0.6 <= aspect_ratio <= 1.4  # Portrait to square
+            is_reasonable_size = 5000 < image_size < 200000  # 5KB to 200KB
+            is_low_coverage = coverage < 0.3  # Less than 30% of page
+            
+            if is_small and is_portrait and is_reasonable_size and is_low_coverage:
+                score = 100  # High score for ideal profile photo
+                logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} action=PROFILE_CANDIDATE score={score}")
+                profile_candidates.append({
                     "bytes": image_bytes,
                     "ext": image_ext,
-                    "size": image_size
-                }
-                largest_size = image_size
-                logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} action=SELECTED_PROFILE_PHOTO area={image_size}")
+                    "size": image_size,
+                    "score": score
+                })
+            elif coverage > 0.8:
+                # This is a scanned CV (image covers >80% of page) - try face detection
+                logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} coverage={coverage:.1%} action=SCANNED_CV_DETECTED attempting_face_detection")
+                
+                try:
+                    # Convert image to OpenCV format
+                    nparr = np.frombuffer(image_bytes, np.uint8)
+                    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    
+                    if img is None:
+                        logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} face_detection=FAILED reason=opencv_decode_failed")
+                        continue
+                    
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    
+                    # Use Haar Cascade for face detection
+                    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+                    faces = face_cascade.detectMultiScale(
+                        gray,
+                        scaleFactor=1.1,
+                        minNeighbors=5,
+                        minSize=(80, 80),  # Minimum face size
+                        flags=cv2.CASCADE_SCALE_IMAGE
+                    )
+                    
+                    if len(faces) > 0:
+                        # Get the first (usually best) face
+                        x, y, w, h = faces[0]
+                        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} face_detected at=({x},{y}) size={w}x{h}")
+                        
+                        # Crop face with padding (20% on each side)
+                        padding = int(max(w, h) * 0.2)
+                        x1 = max(0, x - padding)
+                        y1 = max(0, y - padding)
+                        x2 = min(img.shape[1], x + w + padding)
+                        y2 = min(img.shape[0], y + h + padding)
+                        
+                        face_crop = img[y1:y2, x1:x2]
+                        
+                        # Convert back to JPEG bytes
+                        success, buffer = cv2.imencode('.jpg', face_crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                        if success:
+                            face_bytes = buffer.tobytes()
+                            face_size = len(face_bytes)
+                            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} face_extracted size={face_size} dims={(x2-x1)}x{(y2-y1)}")
+                            
+                            profile_candidates.append({
+                                "bytes": face_bytes,
+                                "ext": "jpg",
+                                "size": face_size,
+                                "score": 90  # High score for detected face
+                            })
+                        else:
+                            logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} face_encode_failed")
+                    else:
+                        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} face_detection=NO_FACE_FOUND")
+                        
+                except Exception as face_err:
+                    logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} image_{img_index} face_detection_error={face_err}")
+        
         pdf_document.close()
-        if not largest_image:
-            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} file=PDF images_found={len(image_list)} action=SKIPPED_NO_VALID_IMAGE all_sizes={all_sizes}")
+        
+        # Select best profile photo candidate
+        if not profile_candidates:
+            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=NO_PROFILE_PHOTO_FOUND total_images={len(image_list)}")
             return None
-        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} uploading profile photo size={largest_image['size']} ext={largest_image['ext']}")
+        
+        # Sort by score (highest first), then by size
+        profile_candidates.sort(key=lambda x: (x["score"], x["size"]), reverse=True)
+        best_photo = profile_candidates[0]
+        
+        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} uploading best_candidate score={best_photo['score']} size={best_photo['size']} ext={best_photo['ext']}")
+        
         photo_url = upload_photo_to_supabase(
-            largest_image["bytes"],
+            best_photo["bytes"],
             attachment_id,
-            largest_image["ext"]
+            best_photo["ext"]
         )
+        
         if photo_url:
             logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} uploaded_as={photo_url}")
         else:
             logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} upload_failed action=UPLOAD_ERROR")
+            
         return photo_url
+        
     except Exception as e:
         logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} extraction_failed error={e}")
         import traceback
