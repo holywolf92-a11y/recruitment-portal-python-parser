@@ -16,5 +16,5 @@ boto3>=1.28.0
 # DO NOT use opencv-python (GUI version requires libxcb)
 opencv-python-headless>=4.8.0
 numpy>=1.24.0
-mediapipe>=0.10.0
-scipy>=1.11.0
+# Note: Removed mediapipe & scipy to avoid opencv dependency conflicts on Railway
+# Face detection uses cv2 cascade classifier (sufficient for headshots)

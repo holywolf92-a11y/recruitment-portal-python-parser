@@ -6,6 +6,10 @@ import hashlib
 import os
 import logging
 
+# Configure logging FIRST (before any imports that might fail)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -34,7 +38,7 @@ import re
 # Import cv2 with fallback - Railway containers are headless and need opencv-python-headless
 try:
     import cv2  # IMPORTANT: Must be headless version for Railway (no libxcb required)
-    import numpy as np  # Needed by MediaPipe and cv2
+    import numpy as np  # Needed by cv2
     CV2_AVAILABLE = True
 except ImportError as e:
     CV2_AVAILABLE = False
@@ -42,10 +46,6 @@ except ImportError as e:
     logger.error("[STARTUP] Make sure requirements.txt has 'opencv-python-headless' (not opencv-python GUI)")
     cv2 = None
     np = None
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 app = FastAPI(title="CV Parser Service", version="2.1.1-bugfix-pil-bytes")
 
@@ -1564,50 +1564,52 @@ def detect_photo_region_heuristic(image: 'cv2.Mat') -> Optional[tuple]:
 
 def detect_faces_with_mediapipe(image: 'cv2.Mat') -> list:
     """
-    Detect faces using MediaPipe (modern, accurate, handles all angles).
+    Detect faces using cv2 cascade classifier (Haar Cascade).
+    Works well for headshots which is our primary use case.
     
     Returns:
         List of (x, y, w, h, confidence) for each detected face
     """
     try:
-        import mediapipe as mp
+        if not CV2_AVAILABLE:
+            logger.warning("[FACE_DETECT] cv2 not available, skipping face detection")
+            return []
         
-        # Initialize MediaPipe Face Detection
-        mp_face_detection = mp.solutions.face_detection
-        with mp_face_detection.FaceDetection(
-            model_selection=1,  # 1 = full-range (works on all faces)
-            min_detection_confidence=0.7
-        ) as face_detection:
-            # Convert BGR to RGB
-            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            results = face_detection.process(rgb_image)
-            
-            faces = []
-            if results.detections:
-                h, w = image.shape[:2]
-                for detection in results.detections:
-                    bbox = detection.location_data.relative_bounding_box
-                    x = int(bbox.xmin * w)
-                    y = int(bbox.ymin * h)
-                    box_w = int(bbox.width * w)
-                    box_h = int(bbox.height * h)
-                    confidence = detection.score[0] if detection.score else 0.5
-                    
-                    # Validate bounds
-                    x = max(0, x)
-                    y = max(0, y)
-                    box_w = min(box_w, w - x)
-                    box_h = min(box_h, h - y)
-                    
-                    if box_w > 0 and box_h > 0:
-                        faces.append((x, y, box_w, box_h, float(confidence)))
-                        logger.info(f"[FACE_DETECT] Face at ({x},{y}) {box_w}x{box_h} confidence={confidence:.2f}")
-            
-            logger.info(f"[FACE_DETECT] MediaPipe found {len(faces)} faces")
-            return faces
+        # Use Haar Cascade for face detection (built-in, no external deps)
+        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        cascade = cv2.CascadeClassifier(cascade_path)
+        
+        if cascade.empty():
+            logger.warning("[FACE_DETECT] Haar cascade not found")
+            return []
+        
+        # Convert to grayscale for cascade classifier
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Detect faces
+        faces = cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.3,
+            minNeighbors=4,
+            minSize=(50, 50),
+            maxSize=(image.shape[1], image.shape[0])
+        )
+        
+        # Convert to our format: (x, y, w, h, confidence)
+        face_list = []
+        for (x, y, w, h) in faces:
+            # Estimate confidence based on face size ratio (normalized to 0-1)
+            face_area_ratio = (w * h) / (image.shape[0] * image.shape[1])
+            # Valid faces are typically 10-50% of image
+            confidence = min(1.0, face_area_ratio * 3)
+            face_list.append((x, y, w, h, float(confidence)))
+            logger.info(f"[FACE_DETECT] Face at ({x},{y}) {w}x{h} confidence={confidence:.2f}")
+        
+        logger.info(f"[FACE_DETECT] Haar cascade found {len(face_list)} faces")
+        return face_list
             
     except Exception as e:
-        logger.warning(f"[FACE_DETECT] MediaPipe failed: {e}")
+        logger.warning(f"[FACE_DETECT] Face detection failed: {e}")
         return []
 
 def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Optional[str]:
