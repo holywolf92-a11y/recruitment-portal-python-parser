@@ -30,6 +30,8 @@ from PIL import Image
 import base64
 from supabase import create_client
 import re
+import cv2  # IMPORTANT: Import at module level (headless version required for Railway)
+import numpy as np  # Needed by MediaPipe and cv2
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -1459,7 +1461,6 @@ def is_image_blurry(image: 'cv2.Mat', threshold: float = 100.0) -> bool:
     Lower variance = blurrier. Typical threshold: 100.
     """
     try:
-        import cv2
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
         is_blurry = laplacian_var < threshold
@@ -1475,7 +1476,6 @@ def is_image_too_dark_or_bright(image: 'cv2.Mat', dark_threshold: int = 30, brig
     Returns (is_bad, reason).
     """
     try:
-        import cv2
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         mean_brightness = gray.mean()
         
@@ -1505,7 +1505,6 @@ def detect_photo_region_heuristic(image: 'cv2.Mat') -> Optional[tuple]:
     - Medium size (not too small icon, not full page)
     """
     try:
-        import cv2
         h, w = image.shape[:2]
         
         # Search in top 40% of page (where photos usually are)
@@ -1570,7 +1569,6 @@ def detect_faces_with_mediapipe(image: 'cv2.Mat') -> list:
             min_detection_confidence=0.7
         ) as face_detection:
             # Convert BGR to RGB
-            import cv2
             rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             results = face_detection.process(rgb_image)
             
@@ -1615,9 +1613,6 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
     Returns the public URL of the uploaded photo, or None if no photo found.
     """
     try:
-        import cv2
-        import numpy as np
-        
         # Step 1: Normalize PDF to images at 300 DPI
         pdf_document = fitz.open(stream=pdf_content, filetype="pdf")
         if pdf_document.page_count == 0:
@@ -1628,8 +1623,7 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
         first_page = pdf_document[0]
         pix = first_page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom ≈ 144 DPI
         img_data = pix.tobytes("png")
-        
-        import io
+                import io
         from PIL import Image as PILImage
         pil_img = PILImage.open(io.BytesIO(img_data))
         cv_image = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
