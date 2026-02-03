@@ -1,14 +1,18 @@
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+)
+
+logger = logging.getLogger("python-parser")
+
 from fastapi import FastAPI, HTTPException, Header, File, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import hmac
 import hashlib
 import os
-import logging
-
-# Configure logging FIRST (before any imports that might fail)
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 from pathlib import Path
 from dotenv import load_dotenv
@@ -37,13 +41,15 @@ import re
 
 # Import cv2 with fallback - Railway containers are headless and need opencv-python-headless
 try:
-    import cv2  # IMPORTANT: Must be headless version for Railway (no libxcb required)
+    import cv2  # MUST be opencv-python-headless on Railway
     import numpy as np  # Needed by cv2
     CV2_AVAILABLE = True
-except ImportError as e:
+except Exception as e:
     CV2_AVAILABLE = False
-    logger.error(f"[STARTUP] WARNING: cv2 import failed: {e}. Photo extraction will be disabled.")
-    logger.error("[STARTUP] Make sure requirements.txt has 'opencv-python-headless' (not opencv-python GUI)")
+    logger.warning(
+        f"[STARTUP] cv2 import failed: {e}. "
+        "Profile photo extraction will be disabled."
+    )
     cv2 = None
     np = None
 
@@ -1618,15 +1624,14 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
     
     1. Normalize PDF to images (consistent processing)
     2. Find photo-like regions (avoid false positives in text/logos)
-    3. Detect faces (MediaPipe - modern, accurate)
+    3. Detect faces (Haar Cascade - efficient, no external deps)
     4. Quality checks (blur, brightness, size)
     5. Smart cropping and upload
     
     Returns the public URL of the uploaded photo, or None if no photo found.
     """
-    # Check if cv2 is available
     if not CV2_AVAILABLE:
-        logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} extraction_failed reason=CV2_NOT_AVAILABLE")
+        logger.warning("[PHOTO_EXTRACT] cv2 unavailable, skipping photo extraction")
         return None
     
     try:
