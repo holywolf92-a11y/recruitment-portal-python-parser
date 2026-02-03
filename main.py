@@ -1157,8 +1157,12 @@ async def parse_cv_from_url(
         # Extract text from PDF
         text_content = extract_text_from_pdf(file_content)
         
-        # Extract profile photo (non-blocking - won't fail if extraction fails)
-        profile_photo_url = extract_profile_photo_from_pdf(file_content, attachment_id or "unknown")
+        # DISABLED: Heuristic photo extraction (Phase A - see PHOTO_EXTRACTION_PHASES.md)
+        # The scipy-based heuristics were extracting text regions instead of faces
+        # Backend AI extraction (OpenAI Vision) will handle photo extraction instead
+        # TODO: Re-enable in Phase C after installing real face detection library
+        # profile_photo_url = extract_profile_photo_from_pdf(file_content, attachment_id or "unknown")
+        profile_photo_url = None  # Temporarily disabled
         
         # Parse with OpenAI (fallback to Vision when text extraction is weak or placeholder detected)
         used_vision = False
@@ -1174,7 +1178,8 @@ async def parse_cv_from_url(
             parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
             used_vision = True
         
-        # Add profile photo URL to parsed data if extracted
+        # Note: profile_photo_url is disabled - backend AI will extract photos instead
+        # (See backend/src/workers/cvParserWorker.ts lines 598-623)
         if profile_photo_url:
             parsed_data['profile_photo_url'] = profile_photo_url
         
