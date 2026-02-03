@@ -38,20 +38,13 @@ from PIL import Image
 import base64
 from supabase import create_client
 import re
+import numpy as np  # For image arrays
+from scipy import ndimage  # For image processing
+from scipy.ndimage import gaussian_filter
 
-# Import cv2 with fallback - Railway containers are headless and need opencv-python-headless
-try:
-    import cv2  # MUST be opencv-python-headless on Railway
-    import numpy as np  # Needed by cv2
-    CV2_AVAILABLE = True
-except Exception as e:
-    CV2_AVAILABLE = False
-    logger.warning(
-        f"[STARTUP] cv2 import failed: {e}. "
-        "Profile photo extraction will be disabled."
-    )
-    cv2 = None
-    np = None
+# cv2 is not needed - using PIL + scipy instead
+CV2_AVAILABLE = True  # We can do face detection with PIL + scipy
+CV2_FALLBACK_AVAILABLE = False
 
 app = FastAPI(title="CV Parser Service", version="2.1.1-bugfix-pil-bytes")
 
@@ -1471,14 +1464,25 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
         logger.error(f"[PDFExtraction] PDF extraction error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to extract PDF text: {str(e)}")
 
-def is_image_blurry(image: 'cv2.Mat', threshold: float = 100.0) -> bool:
+def is_image_blurry(image: Image.Image, threshold: float = 100.0) -> bool:
     """
-    Check if image is blurry using Laplacian variance method.
+    Check if image is blurry using Laplacian variance method (via scipy).
     Lower variance = blurrier. Typical threshold: 100.
     """
     try:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        # Convert PIL image to numpy array
+        img_array = np.array(image)
+        
+        # Convert to grayscale if needed
+        if len(img_array.shape) == 3:
+            gray = np.mean(img_array, axis=2).astype(np.uint8)
+        else:
+            gray = img_array
+        
+        # Apply Laplacian filter
+        laplacian = ndimage.laplace(gray.astype(float))
+        laplacian_var = np.var(laplacian)
+        
         is_blurry = laplacian_var < threshold
         logger.info(f"[QUALITY_CHECK] blur_check variance={laplacian_var:.1f} threshold={threshold} is_blurry={is_blurry}")
         return is_blurry
@@ -1486,14 +1490,22 @@ def is_image_blurry(image: 'cv2.Mat', threshold: float = 100.0) -> bool:
         logger.warning(f"[QUALITY_CHECK] blur_check failed: {e}")
         return False
 
-def is_image_too_dark_or_bright(image: 'cv2.Mat', dark_threshold: int = 30, bright_threshold: int = 220) -> tuple:
+def is_image_too_dark_or_bright(image: Image.Image, dark_threshold: int = 30, bright_threshold: int = 220) -> tuple:
     """
     Check if image is too dark or too bright.
     Returns (is_bad, reason).
     """
     try:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        mean_brightness = gray.mean()
+        # Convert PIL image to numpy array
+        img_array = np.array(image)
+        
+        # Convert to grayscale if needed
+        if len(img_array.shape) == 3:
+            gray = np.mean(img_array, axis=2)
+        else:
+            gray = img_array.astype(float)
+        
+        mean_brightness = np.mean(gray)
         
         if mean_brightness < dark_threshold:
             logger.info(f"[QUALITY_CHECK] brightness_check brightness={mean_brightness:.1f} reason=TOO_DARK")
@@ -1508,111 +1520,137 @@ def is_image_too_dark_or_bright(image: 'cv2.Mat', dark_threshold: int = 30, brig
         logger.warning(f"[QUALITY_CHECK] brightness_check failed: {e}")
         return False, "UNKNOWN"
 
-def detect_photo_region_heuristic(image: 'cv2.Mat') -> Optional[tuple]:
+def detect_photo_region_heuristic(image: Image.Image) -> Optional[tuple]:
     """
-    Heuristic: Find likely photo region on document page.
+    Heuristic: Find likely photo region on document page using simple brightness analysis.
     
     Returns:
         (x, y, w, h, confidence) of most likely photo region, or None
-    
-    Heuristics:
-    - Photo typically in top corners (first 40% of page)
-    - Portrait aspect ratio (0.6-1.2)
-    - Medium size (not too small icon, not full page)
     """
     try:
-        h, w = image.shape[:2]
+        w, h = image.size
+        
+        # Convert to numpy array for analysis
+        img_array = np.array(image)
+        
+        # Convert to grayscale if needed
+        if len(img_array.shape) == 3:
+            gray = np.mean(img_array, axis=2)
+        else:
+            gray = img_array.astype(float)
         
         # Search in top 40% of page (where photos usually are)
-        search_region = image[:int(h * 0.4), :]
+        search_height = int(h * 0.4)
+        search_region = gray[:search_height, :]
         
-        # Find contours
-        gray = cv2.cvtColor(search_region, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        candidates = []
-        for contour in contours:
-            x, y, cw, ch = cv2.boundingRect(contour)
-            area = cw * ch
-            aspect = cw / ch if ch > 0 else 0
+        # Find regions with good contrast (photos tend to have varied brightness)
+        # Using simple edge detection via gradient
+        if search_height > 10 and w > 10:
+            # Calculate horizontal and vertical gradients
+            gy = np.abs(np.diff(search_region, axis=0))
+            gx = np.abs(np.diff(search_region, axis=1))
             
-            # Photo-like criteria
-            min_area = 50 * 50  # At least 50x50
-            max_area = int(w * 0.3) ** 2  # Not more than 30% of page width squared
-            is_portrait = 0.6 <= aspect <= 1.2  # Portrait to square
+            # Edge magnitude
+            edges = (np.pad(gy, ((0, 1), (0, 0)), mode='constant') + 
+                    np.pad(gx, ((0, 0), (0, 1)), mode='constant'))
             
-            if min_area < area < max_area and is_portrait:
-                # Confidence based on how portrait-like it is
-                portrait_score = 1.0 - abs(aspect - 0.9) / 0.3  # Peak at 0.9 aspect
-                portrait_score = max(0.5, portrait_score)
-                candidates.append({
-                    "rect": (x, y, cw, ch),
-                    "confidence": portrait_score,
-                    "area": area
-                })
+            # Find regions with high edge density
+            window_size = 100
+            if edges.shape[0] > window_size and edges.shape[1] > window_size:
+                edge_density = ndimage.uniform_filter(edges, size=window_size)
+                
+                # Find peak edge density (likely photo region)
+                max_idx = np.unravel_index(np.argmax(edge_density), edge_density.shape)
+                if max_idx[0] > 0 and max_idx[1] > 0:
+                    y = max(0, max_idx[0] - window_size // 2)
+                    x = max(0, max_idx[1] - window_size // 2)
+                    
+                    # Confidence based on edge density
+                    confidence = min(1.0, edge_density[max_idx] / 10.0)
+                    if confidence > 0.3:
+                        logger.info(f"[PHOTO_REGION] Detected at ({x},{y}) size={window_size}x{window_size} confidence={confidence:.2f}")
+                        return (x, y, window_size, window_size, confidence)
         
-        if not candidates:
-            logger.info("[PHOTO_REGION] No photo region detected")
-            return None
-        
-        # Prefer top-left or top-center (most common photo placement)
-        candidates.sort(key=lambda c: (-c["confidence"], c["rect"][0]))
-        best = candidates[0]
-        x, y, cw, ch = best["rect"]
-        
-        logger.info(f"[PHOTO_REGION] Detected at ({x},{y}) size={cw}x{ch} confidence={best['confidence']:.2f}")
-        return (x, y, cw, ch, best["confidence"])
+        logger.info("[PHOTO_REGION] No obvious photo region detected")
+        return None
         
     except Exception as e:
         logger.warning(f"[PHOTO_REGION] detection failed: {e}")
         return None
 
-def detect_faces_with_mediapipe(image: 'cv2.Mat') -> list:
+def detect_faces_with_mediapipe(image: Image.Image) -> list:
     """
-    Detect faces using cv2 cascade classifier (Haar Cascade).
-    Works well for headshots which is our primary use case.
+    Detect potential face regions using simple brightness/contrast analysis.
+    Since we don't have opencv, use heuristics: face regions typically have
+    good contrast and specific brightness ranges.
     
     Returns:
-        List of (x, y, w, h, confidence) for each detected face
+        List of (x, y, w, h, confidence) for potential face regions
     """
     try:
-        if not CV2_AVAILABLE:
-            logger.warning("[FACE_DETECT] cv2 not available, skipping face detection")
-            return []
+        w, h = image.size
         
-        # Use Haar Cascade for face detection (built-in, no external deps)
-        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        cascade = cv2.CascadeClassifier(cascade_path)
+        # Convert to numpy array
+        img_array = np.array(image)
         
-        if cascade.empty():
-            logger.warning("[FACE_DETECT] Haar cascade not found")
-            return []
+        # Convert to grayscale if needed
+        if len(img_array.shape) == 3:
+            gray = np.mean(img_array, axis=2)
+        else:
+            gray = img_array.astype(float)
         
-        # Convert to grayscale for cascade classifier
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # Normalize to 0-1 range
+        gray = (gray - gray.min()) / (gray.max() - gray.min() + 1e-5)
         
-        # Detect faces
-        faces = cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.3,
-            minNeighbors=4,
-            minSize=(50, 50),
-            maxSize=(image.shape[1], image.shape[0])
-        )
+        # Calculate local contrast using gaussian blur difference
+        smooth = gaussian_filter(gray, sigma=5)
+        contrast = np.abs(gray - smooth)
         
-        # Convert to our format: (x, y, w, h, confidence)
-        face_list = []
-        for (x, y, w, h) in faces:
-            # Estimate confidence based on face size ratio (normalized to 0-1)
-            face_area_ratio = (w * h) / (image.shape[0] * image.shape[1])
-            # Valid faces are typically 10-50% of image
-            confidence = min(1.0, face_area_ratio * 3)
-            face_list.append((x, y, w, h, float(confidence)))
-            logger.info(f"[FACE_DETECT] Face at ({x},{y}) {w}x{h} confidence={confidence:.2f}")
+        # Find regions with good contrast (faces have distinctive features)
+        threshold = np.percentile(contrast, 75)
+        high_contrast = contrast > threshold
         
-        logger.info(f"[FACE_DETECT] Haar cascade found {len(face_list)} faces")
-        return face_list
+        # Find connected regions of high contrast
+        labeled, num_features = ndimage.label(high_contrast)
+        
+        faces = []
+        min_size = 30
+        max_size = min(w, h) // 2
+        
+        for region_id in range(1, num_features + 1):
+            region = (labeled == region_id)
+            
+            # Get bounding box
+            rows = np.any(region, axis=1)
+            cols = np.any(region, axis=0)
+            if not rows.any() or not cols.any():
+                continue
+            
+            ymin, ymax = np.where(rows)[0][[0, -1]]
+            xmin, xmax = np.where(cols)[0][[0, -1]]
+            
+            rw = xmax - xmin
+            rh = ymax - ymin
+            
+            # Face-like region criteria
+            if min_size < rw < max_size and min_size < rh < max_size:
+                aspect_ratio = rw / rh if rh > 0 else 0
+                # Faces are roughly square to slightly portrait (0.7-1.2)
+                if 0.7 <= aspect_ratio <= 1.2:
+                    # Confidence based on contrast and size
+                    region_contrast = np.mean(contrast[region])
+                    confidence = min(1.0, region_contrast * 2)
+                    
+                    if confidence > 0.4:
+                        faces.append((xmin, ymin, rw, rh, confidence))
+                        logger.info(f"[FACE_DETECT] Region at ({xmin},{ymin}) {rw}x{rh} confidence={confidence:.2f}")
+        
+        # Sort by confidence and keep top 3
+        faces.sort(key=lambda f: f[4], reverse=True)
+        faces = faces[:3]
+        
+        logger.info(f"[FACE_DETECT] Found {len(faces)} potential face regions")
+        return faces
             
     except Exception as e:
         logger.warning(f"[FACE_DETECT] Face detection failed: {e}")
@@ -1620,50 +1658,47 @@ def detect_faces_with_mediapipe(image: 'cv2.Mat') -> list:
 
 def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Optional[str]:
     """
-    Extract profile photo from PDF using best-practice pipeline:
+    Extract profile photo from PDF using PIL + scipy (no OpenCV needed).
     
-    1. Normalize PDF to images (consistent processing)
-    2. Find photo-like regions (avoid false positives in text/logos)
-    3. Detect faces (Haar Cascade - efficient, no external deps)
-    4. Quality checks (blur, brightness, size)
+    Pipeline:
+    1. Normalize PDF to images 
+    2. Find photo-like regions (heuristic)
+    3. Detect face regions (contrast-based)
+    4. Quality checks (blur, brightness)
     5. Smart cropping and upload
     
     Returns the public URL of the uploaded photo, or None if no photo found.
     """
-    if not CV2_AVAILABLE:
-        logger.warning("[PHOTO_EXTRACT] cv2 unavailable, skipping photo extraction")
-        return None
-    
     try:
-        # Step 1: Normalize PDF to images at 300 DPI
+        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=START")
+        
+        # Step 1: Normalize PDF to images 
         pdf_document = fitz.open(stream=pdf_content, filetype="pdf")
         if pdf_document.page_count == 0:
             logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=NO_PAGES")
             return None
         
-        # Get first page and render at 300 DPI (good quality + reasonable size)
+        # Get first page and render to image
         first_page = pdf_document[0]
-        pix = first_page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom ≈ 144 DPI
+        pix = first_page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom for quality
         img_data = pix.tobytes("png")
-        pil_img = PILImage.open(io.BytesIO(img_data))
-        pil_img = PILImage.open(io.BytesIO(img_data))
-        cv_image = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        pil_img = Image.open(io.BytesIO(img_data))
         pdf_document.close()
         
-        h, w = cv_image.shape[:2]
+        w, h = pil_img.size
         logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} page_rendered dims={w}x{h}")
         
         # Step 2: Find photo-like regions (heuristic)
-        photo_region = detect_photo_region_heuristic(cv_image)
+        photo_region = detect_photo_region_heuristic(pil_img)
         
         # If heuristic found a region, crop it. Otherwise, use full page.
         if photo_region:
             x, y, rw, rh, conf = photo_region
-            crop_img = cv_image[y:y+rh, x:x+rw]
+            crop_img = pil_img.crop((x, y, x+rw, y+rh))
             logger.info(f"[PHOTO_EXTRACT] Using detected photo region")
         else:
-            # Fall back to full page (e.g., for full-page scans)
-            crop_img = cv_image
+            # Fall back to full page
+            crop_img = pil_img
             logger.info(f"[PHOTO_EXTRACT] Using full page (no photo region detected)")
         
         # Step 3: Detect faces in crop region
@@ -1676,11 +1711,11 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
         # Sort by confidence (highest first)
         faces.sort(key=lambda f: f[4], reverse=True)
         best_face = faces[0]
-        x, y, fw, fh, face_conf = best_face
+        fx, fy, fw, fh, face_conf = best_face
         
         # Step 4: Quality checks
         # 4a. Check if face is reasonable size relative to crop
-        crop_h, crop_w = crop_img.shape[:2]
+        crop_w, crop_h = crop_img.size
         face_area_ratio = (fw * fh) / (crop_w * crop_h)
         if face_area_ratio < 0.15 or face_area_ratio > 0.8:
             logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=FACE_SIZE face_ratio={face_area_ratio:.2f}")
@@ -1699,37 +1734,35 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
         
         # Step 5: Smart cropping (expand face with padding, standardize to square)
         padding = int(max(fw, fh) * 0.15)  # 15% padding around face
-        x1 = max(0, x - padding)
-        y1 = max(0, y - padding)
-        x2 = min(crop_w, x + fw + padding)
-        y2 = min(crop_h, y + fh + padding)
+        x1 = max(0, fx - padding)
+        y1 = max(0, fy - padding)
+        x2 = min(crop_w, fx + fw + padding)
+        y2 = min(crop_h, fy + fh + padding)
         
-        face_crop = crop_img[y1:y2, x1:x2]
-        crop_h_final, crop_w_final = face_crop.shape[:2]
+        face_crop_pil = crop_img.crop((x1, y1, x2, y2))
+        crop_w_final, crop_h_final = face_crop_pil.size
         
-        # Standardize to square (512x512 is good for avatars)
+        # Standardize to square (512x512 for avatars)
         target_size = 512
         if crop_w_final != crop_h_final:
             # Pad to square
             max_dim = max(crop_w_final, crop_h_final)
-            square_img = np.zeros((max_dim, max_dim, 3), dtype=np.uint8)
+            square_img = Image.new('RGB', (max_dim, max_dim), (255, 255, 255))
             x_offset = (max_dim - crop_w_final) // 2
             y_offset = (max_dim - crop_h_final) // 2
-            square_img[y_offset:y_offset+crop_h_final, x_offset:x_offset+crop_w_final] = face_crop
-            face_crop = square_img
+            square_img.paste(face_crop_pil, (x_offset, y_offset))
+            face_crop_pil = square_img
         
         # Resize to target size
-        face_crop = cv2.resize(face_crop, (target_size, target_size), interpolation=cv2.INTER_LANCZOS4)
+        face_crop_pil = face_crop_pil.resize((target_size, target_size), Image.Resampling.LANCZOS)
         
         logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} face_ready size={target_size}x{target_size} confidence={face_conf:.2f}")
         
         # Convert to JPEG bytes
-        success, buffer = cv2.imencode('.jpg', face_crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        if not success:
-            logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=JPEG_ENCODE_FAILED")
-            return None
-        
-        photo_bytes = buffer.tobytes()
+        from io import BytesIO
+        buffer = BytesIO()
+        face_crop_pil.save(buffer, format='JPEG', quality=95)
+        photo_bytes = buffer.getvalue()
         
         # Upload to storage
         photo_url = upload_photo_to_supabase(photo_bytes, attachment_id, "jpg")
