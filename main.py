@@ -1690,6 +1690,7 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
         
         # Step 2: Find photo-like regions (heuristic)
         photo_region = detect_photo_region_heuristic(pil_img)
+        direct_region_conf: Optional[float] = None
         
         # If heuristic found a region with high confidence, use it directly
         # (high confidence region IS the photo/face area)
@@ -1701,8 +1702,8 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
             
             # If high confidence, skip additional face detection
             if conf >= 0.90:
-                logger.info(f"[FACE_DETECT] High confidence region - using directly")
-                faces = True  # Treat region as valid
+                logger.info(f"[FACE_DETECT] High confidence region - skipping face detection")
+                direct_region_conf = conf
             else:
                 # For lower confidence, do additional face detection
                 faces = detect_faces_with_mediapipe(crop_img)
@@ -1718,6 +1719,53 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
             if not faces:
                 logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=NO_FACES_DETECTED")
                 return None
+
+        # If we have a high-confidence photo region, treat the region itself as the final avatar.
+        if direct_region_conf is not None:
+            crop_w, crop_h = crop_img.size
+            if crop_w < 80 or crop_h < 80:
+                logger.warning(
+                    f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=REGION_TOO_SMALL dims={crop_w}x{crop_h}"
+                )
+                return None
+
+            if is_image_blurry(crop_img, threshold=100):
+                logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=BLURRY")
+                return None
+
+            is_bad_brightness, brightness_reason = is_image_too_dark_or_bright(crop_img)
+            if is_bad_brightness:
+                logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason={brightness_reason}")
+                return None
+
+            # Standardize to square (512x512 for avatars)
+            target_size = 512
+            avatar_pil = crop_img.convert('RGB')
+            aw, ah = avatar_pil.size
+            if aw != ah:
+                max_dim = max(aw, ah)
+                square_img = Image.new('RGB', (max_dim, max_dim), (255, 255, 255))
+                x_offset = (max_dim - aw) // 2
+                y_offset = (max_dim - ah) // 2
+                square_img.paste(avatar_pil, (x_offset, y_offset))
+                avatar_pil = square_img
+
+            avatar_pil = avatar_pil.resize((target_size, target_size), Image.Resampling.LANCZOS)
+            logger.info(
+                f"[PHOTO_EXTRACT] candidate_id={attachment_id} face_ready size={target_size}x{target_size} confidence={direct_region_conf:.2f}"
+            )
+
+            from io import BytesIO
+            buffer = BytesIO()
+            avatar_pil.save(buffer, format='JPEG', quality=95)
+            photo_bytes = buffer.getvalue()
+
+            photo_url = upload_photo_to_supabase(photo_bytes, attachment_id, "jpg")
+            if photo_url:
+                logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} SUCCESS uploaded_as={photo_url}")
+            else:
+                logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=UPLOAD_FAILED")
+            return photo_url
         
         # Sort by confidence (highest first)
         faces.sort(key=lambda f: f[4], reverse=True)
