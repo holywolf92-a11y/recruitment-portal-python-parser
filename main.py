@@ -30,8 +30,18 @@ from PIL import Image
 import base64
 from supabase import create_client
 import re
-import cv2  # IMPORTANT: Import at module level (headless version required for Railway)
-import numpy as np  # Needed by MediaPipe and cv2
+
+# Import cv2 with fallback - Railway containers are headless and need opencv-python-headless
+try:
+    import cv2  # IMPORTANT: Must be headless version for Railway (no libxcb required)
+    import numpy as np  # Needed by MediaPipe and cv2
+    CV2_AVAILABLE = True
+except ImportError as e:
+    CV2_AVAILABLE = False
+    logger.error(f"[STARTUP] WARNING: cv2 import failed: {e}. Photo extraction will be disabled.")
+    logger.error("[STARTUP] Make sure requirements.txt has 'opencv-python-headless' (not opencv-python GUI)")
+    cv2 = None
+    np = None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -1612,6 +1622,11 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
     
     Returns the public URL of the uploaded photo, or None if no photo found.
     """
+    # Check if cv2 is available
+    if not CV2_AVAILABLE:
+        logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} extraction_failed reason=CV2_NOT_AVAILABLE")
+        return None
+    
     try:
         # Step 1: Normalize PDF to images at 300 DPI
         pdf_document = fitz.open(stream=pdf_content, filetype="pdf")
