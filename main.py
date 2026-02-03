@@ -1711,7 +1711,7 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
         
         # Step 3: Quality checks
         # 3a. Check face size (reject if too small)
-        if face_width < 80 or face_height < 80:
+        if face_width < 50 or face_height < 50:
             logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=FACE_TOO_SMALL dims={face_width}x{face_height}")
             return None
         
