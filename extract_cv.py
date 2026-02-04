@@ -61,18 +61,21 @@ def extract_cv_data(cv_url: str) -> Dict[str, Any]:
     if not cv_text:
         raise Exception("No text could be extracted from the CV")
     
-    # Create extraction prompt
+    # Create extraction prompt with enhanced nationality detection
     prompt = f"""
     Extract the following information from this CV/Resume. For each field, provide a confidence score (0.0 to 1.0) indicating how certain you are about the extracted value.
     
     Return ONLY a valid JSON object with this exact structure:
     {{
         "nationality": "string or null",
+        "nationality_inferred_from": "string or null (source: explicit, education_location, work_location, language_skills, passport_country)",
+        "primary_education_country": "string or null (country where primary education was obtained)",
+        "primary_work_countries": ["array of countries where person has worked"],
         "position": "string or null (desired job position/title)",
         "experience_years": "number or null (total years of work experience)",
         "country_of_interest": "string or null (country they want to work in)",
         "skills": ["array of strings"],
-        "languages": ["array of strings"],
+        "languages": ["array of strings with proficiency levels"],
         "education": "string or null (highest education qualification)",
         "certifications": ["array of strings"],
         "previous_employment": "string or null (brief summary of work history)",
@@ -92,6 +95,40 @@ def extract_cv_data(cv_url: str) -> Dict[str, Any]:
         }}
     }}
     
+    CRITICAL NATIONALITY DETECTION RULES:
+    
+    1. EXPLICIT NATIONALITY:
+       - If CV explicitly states "Nationality: Pakistan", "Pakistani National", use that with high confidence (0.95+)
+       - Check for passport country codes (PA = Pakistan, IN = India, etc.)
+    
+    2. EDUCATION-BASED INFERENCE (0.7-0.8 confidence):
+       - Identify all cities/universities mentioned in education section
+       - If education is from Pakistan (University of Karachi, FAST-NUCES, Comsats Islamabad, etc.), likely Pakistani
+       - Common Pakistani universities: BZU, PU, CECOS, IQRA, SZABIST, LUMS, GIKI, etc.
+       - If education is from India, likely Indian; from UK/US/Australia, may have adopted that nationality
+       - IMPORTANT: Primary education location is stronger indicator than work location
+    
+    3. WORK EXPERIENCE-BASED INFERENCE (0.6-0.7 confidence):
+       - If person worked in Pakistan for majority of career, likely Pakistani
+       - If person worked in Gulf (Saudi Arabia, UAE, Kuwait), they may be Pakistani/Indian expat
+       - If ALL work experience is in Pakistan, very likely Pakistani (0.75+ confidence)
+    
+    4. LANGUAGE SKILLS:
+       - Urdu language skills indicate likely Pakistani
+       - Hindi indicates likely Indian
+       - Arabic indicates likely Arab nationality
+       - Multiple languages suggest expat background
+    
+    5. COMBINED APPROACH (when nationality not explicit):
+       - Use this priority: Primary Education Country > All Work Countries > Languages > Secondary Education
+       - If ambiguous, return the strongest indicator with accurate confidence score
+       - Include "nationality_inferred_from" field to show reasoning
+    
+    Examples:
+    - Person studied in Karachi, worked in Lahore: Pakistani (0.85)
+    - Person studied in India, worked in Pakistan: Likely Indian (0.65)
+    - Person studied in Pakistan, worked in Saudi Arabia: Likely Pakistani expat (0.75)
+    
     Guidelines:
     - For missing information, use null
     - For empty arrays, use []
@@ -99,6 +136,8 @@ def extract_cv_data(cv_url: str) -> Dict[str, Any]:
     - Calculate experience_years from work history if not explicitly stated
     - Extract country_of_interest from objective/career goals
     - Keep professional_summary concise and factual
+    - ALWAYS include reasoning for nationality inference in "nationality_inferred_from"
+    - If uncertain about nationality, set it and provide lower confidence score with clear source
     
     CV Text:
     {cv_text}

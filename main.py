@@ -41,6 +41,7 @@ import re
 import numpy as np  # For image arrays
 from scipy import ndimage  # For image processing
 from scipy.ndimage import gaussian_filter
+from enhance_nationality import enhance_nationality_with_ai
 
 # cv2 is not needed - using PIL + scipy instead
 CV2_AVAILABLE = True  # We can do face detection with PIL + scipy
@@ -63,6 +64,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+# Vision parsing page limits (kept conservative; can be tuned per env)
+CV_VISION_MAX_PAGES = int(os.getenv("CV_VISION_MAX_PAGES", "2"))
+CV_VISION_MAX_PAGES_FALLBACK = int(os.getenv("CV_VISION_MAX_PAGES_FALLBACK", "4"))
 
 # Normalize SUPABASE_URL for storage3 client which expects a trailing slash
 # Keep a clean version without trailing slash for public URL generation
@@ -115,19 +120,13 @@ def verify_hmac(signature: str, body: bytes) -> bool:
 
 @app.on_event("startup")
 def check_supabase_credentials():
-    """Startup check: verify Supabase env and storage access (partial key logged)."""
+    """Startup check: verify Supabase env and storage access."""
     try:
         if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
             logger.warning("[STARTUP] Supabase env vars missing: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
             return
 
-        # Log partial key for debugging (do not log full key in production)
-        try:
-            short_key = SUPABASE_SERVICE_ROLE_KEY
-            logger.info(f"[STARTUP] SUPABASE_URL={SUPABASE_URL}")
-            logger.info(f"[STARTUP] SUPABASE_SERVICE_ROLE_KEY={short_key[:6]}...{short_key[-6:]}")
-        except Exception:
-            logger.info("[STARTUP] Supabase key partially available")
+        logger.info(f"[STARTUP] SUPABASE_URL={SUPABASE_URL}")
 
         # Quick storage access test
         try:
@@ -854,6 +853,14 @@ async def parse_cv_with_openai(content: str, filename: str) -> dict:
         if not parsed_data.get('country_of_interest'):
             parsed_data['country_of_interest'] = 'missing'
         
+        # ENHANCED: Use AI to infer nationality from education/work experience if not explicitly stated
+        try:
+            parsed_data = enhance_nationality_with_ai(parsed_data)
+            if parsed_data.get('nationality_inferred_from'):
+                logger.info(f"Nationality inference: {parsed_data.get('nationality')} (from {parsed_data.get('nationality_inferred_from')})")
+        except Exception as e:
+            logger.warning(f"Could not enhance nationality detection: {e}")
+        
         logger.info(f"Successfully parsed CV: {filename}")
         return parsed_data
 
@@ -864,56 +871,97 @@ async def parse_cv_with_openai(content: str, filename: str) -> dict:
         logger.error(f"OpenAI parsing error: {e}")
         raise HTTPException(status_code=500, detail=f"CV parsing failed: {str(e)}")
 
-async def parse_cv_with_vision(file_content: bytes, filename: str, max_pages: int = 2) -> dict:
+async def parse_cv_with_vision(file_content: bytes, filename: str, max_pages: int = CV_VISION_MAX_PAGES) -> dict:
     """Parse CV using OpenAI Vision when text extraction is insufficient"""
     try:
         import base64
-        images = []
 
-        pdf_doc = fitz.open(stream=file_content, filetype="pdf")
-        pages_to_render = max(1, min(max_pages, len(pdf_doc)))
+        def render_pdf_pages(pages_to_render: int):
+            images_local = []
+            pdf_doc_local = fitz.open(stream=file_content, filetype="pdf")
+            total_pages_local = len(pdf_doc_local)
+            pages_to_render_local = max(1, min(pages_to_render, total_pages_local))
 
-        for page_index in range(pages_to_render):
-            page = pdf_doc[page_index]
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            img_bytes = pix.tobytes("png")
-            img_base64 = base64.b64encode(img_bytes).decode('utf-8')
-            images.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{img_base64}"}
-            })
-            logger.info(f"[CVVision] Rendered page {page_index + 1} for vision parsing")
+            for page_index in range(pages_to_render_local):
+                page = pdf_doc_local[page_index]
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                img_bytes = pix.tobytes("png")
+                img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+                images_local.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{img_base64}"}
+                })
+                logger.info(f"[CVVision] Rendered page {page_index + 1}/{pages_to_render_local} for vision parsing")
 
-        pdf_doc.close()
+            pdf_doc_local.close()
+            return images_local, total_pages_local, pages_to_render_local
 
+        def strip_code_fences(text: str) -> str:
+            t = text.strip()
+            if t.startswith("```json"):
+                t = t[7:]
+            if t.startswith("```"):
+                t = t[3:]
+            if t.endswith("```"):
+                t = t[:-3]
+            return t.strip()
+
+        def is_placeholder_text(value: Any) -> bool:
+            if not isinstance(value, str):
+                return False
+            lower = value.strip().lower()
+            return lower in {"missing", "null", "undefined", "n/a", "na", "none", "not provided"}
+
+        def needs_more_pages(parsed: dict) -> bool:
+            exp = parsed.get('experience')
+            exp_empty = not isinstance(exp, list) or len(exp) == 0
+            prev = parsed.get('previous_employment')
+            prev_missing = (not prev) or is_placeholder_text(prev)
+            years = parsed.get('experience_years')
+            years_missing = years is None or years == 0
+            return exp_empty and (prev_missing or years_missing)
+
+        async def run_vision_parse(images_payload):
+            prompt = build_cv_prompt("", from_images=True)
+            response = openai.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are a precise CV parser that returns only valid JSON."},
+                    {"role": "user", "content": [{"type": "text", "text": prompt}, *images_payload]},
+                ],
+                temperature=0.1,
+                max_tokens=2000,
+            )
+            result_text_local = strip_code_fences(response.choices[0].message.content or "")
+            parsed_local = json.loads(result_text_local)
+            return post_process_cv_parsed_data(parsed_local)
+
+        images, total_pages, rendered_pages = render_pdf_pages(max_pages)
         if not images:
             raise HTTPException(status_code=400, detail="No pages found in PDF for vision parsing")
 
-        prompt = build_cv_prompt("", from_images=True)
+        parsed_data = await run_vision_parse(images)
 
-        response = openai.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You are a precise CV parser that returns only valid JSON."},
-                {"role": "user", "content": [{"type": "text", "text": prompt}, *images]},
-            ],
-            temperature=0.1,
-            max_tokens=2000,
-        )
+        # If experience extraction is empty and the PDF has more pages, do a second pass with more pages.
+        if needs_more_pages(parsed_data) and total_pages > rendered_pages and CV_VISION_MAX_PAGES_FALLBACK > rendered_pages:
+            second_pages = min(CV_VISION_MAX_PAGES_FALLBACK, total_pages)
+            logger.info(f"[CVVision] Experience appears missing; retrying with {second_pages} pages (pdf has {total_pages})")
+            images2, _, rendered2 = render_pdf_pages(second_pages)
+            if images2 and rendered2 > rendered_pages:
+                parsed_data2 = await run_vision_parse(images2)
+                # Prefer the second pass if it has more experience entries.
+                exp1 = parsed_data.get('experience') if isinstance(parsed_data.get('experience'), list) else []
+                exp2 = parsed_data2.get('experience') if isinstance(parsed_data2.get('experience'), list) else []
+                if len(exp2) > len(exp1):
+                    parsed_data = parsed_data2
 
-        result_text = response.choices[0].message.content.strip()
-
-        # Remove markdown code blocks if present
-        if result_text.startswith("```json"):
-            result_text = result_text[7:]
-        if result_text.startswith("```"):
-            result_text = result_text[3:]
-        if result_text.endswith("```"):
-            result_text = result_text[:-3]
-
-        result_text = result_text.strip()
-        parsed_data = json.loads(result_text)
-        parsed_data = post_process_cv_parsed_data(parsed_data)
+        # ENHANCED: Use AI to infer nationality from education/work experience if not explicitly stated
+        try:
+            parsed_data = enhance_nationality_with_ai(parsed_data)
+            if parsed_data.get('nationality_inferred_from'):
+                logger.info(f"Vision parsing - Nationality inference: {parsed_data.get('nationality')} (from {parsed_data.get('nationality_inferred_from')})")
+        except Exception as e:
+            logger.warning(f"Could not enhance nationality detection in vision parsing: {e}")
 
         return parsed_data
 
