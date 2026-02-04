@@ -37,15 +37,25 @@ except ImportError:
 
 CONFIDENCE_THRESHOLD = 0.88
 DOC_CATEGORIES = [
-    "cv_resume", "passport", "cnic", "driving_license", "police_character_certificate",
-    "certificates", "contracts", "medical_reports", "photos", "other_documents",
+    "cv_resume", 
+    "passport", 
+    "cnic", 
+    "driving_license", 
+    "police_character_certificate",
+    "educational_documents",
+    "experience_certificates",
+    "navttc_reports",
+    "certificates",  # Professional/IT certifications ONLY
+    "contracts", 
+    "medical_reports", 
+    "photos", 
+    "other_documents",
 ]
 
 def normalize_doc_type(category: str) -> str:
     """
     Normalize category to canonical doc_type.
-    Maps variations like 'national_id', 'id_card' -> 'cnic'
-    and 'character_certificate' -> 'police_character_certificate'
+    Maps variations to canonical types for new categories.
     """
     if not category:
         return "other_documents"
@@ -54,19 +64,57 @@ def normalize_doc_type(category: str) -> str:
     
     # Map variations to canonical types
     normalization_map = {
+        # CNIC / National ID
         "national_id": "cnic",
         "id_card": "cnic",
         "nid": "cnic",
-        "driving_license": "driving_license",  # Explicit mapping for consistency
+        
+        # Driving License
+        "driving_license": "driving_license",
         "drivers_license": "driving_license",
         "driver_license": "driving_license",
-        "drivers_licence": "driving_license",  # British spelling
-        "driving_licence": "driving_license",  # British spelling
-        "dl": "driving_license",  # Common abbreviation
+        "drivers_licence": "driving_license",
+        "driving_licence": "driving_license",
+        "dl": "driving_license",
+        
+        # Police Certificate
         "character_certificate": "police_character_certificate",
         "police_clearance": "police_character_certificate",
         "pcc": "police_character_certificate",
         "character_clearance": "police_character_certificate",
+        "police_certificate": "police_character_certificate",
+        
+        # Educational Documents
+        "degree": "educational_documents",
+        "diploma": "educational_documents",
+        "transcript": "educational_documents",
+        "marksheet": "educational_documents",
+        "academic_certificate": "educational_documents",
+        "educational_certificate": "educational_documents",
+        "university_degree": "educational_documents",
+        "college_diploma": "educational_documents",
+        
+        # Experience Certificates
+        "experience_certificate": "experience_certificates",
+        "employment_certificate": "experience_certificates",
+        "experience_letter": "experience_certificates",
+        "service_certificate": "experience_certificates",
+        "employment_letter": "experience_certificates",
+        "work_reference": "experience_certificates",
+        
+        # NAVTTC Reports
+        "navttc": "navttc_reports",
+        "navtic": "navttc_reports",
+        "nvtc": "navttc_reports",
+        "navttc_certificate": "navttc_reports",
+        "vocational_certificate": "navttc_reports",
+        "trade_certificate": "navttc_reports",
+        "technical_training": "navttc_reports",
+        
+        # Professional Certificates
+        "professional_certificate": "certificates",
+        "skill_certificate": "certificates",
+        "it_certificate": "certificates",
     }
     
     # Check if category needs normalization
@@ -82,13 +130,34 @@ def normalize_doc_type(category: str) -> str:
 
 VISION_PROMPT = """You are a document classification and identity extraction AI. Analyze this SINGLE page image and provide:
 
-1. Document category (choose ONE):
+1. Document category (choose ONE - BE SPECIFIC):
+   
+   🎓 EDUCATIONAL DOCUMENTS (academic qualifications):
+   - educational_documents: University degrees (BSc, MSc, BA, MA, PhD), college diplomas, 
+     academic transcripts, marksheets, school certificates, graduation certificates
+   
+   👷 NAVTTC VOCATIONAL REPORTS (government technical training):
+   - navttc_reports: NAVTTC certificates, NAVTIC training reports, NVTC vocational certificates,
+     government technical training, trade test certificates, skill development from NAVTTC
+   
+   💼 EXPERIENCE CERTIFICATES (employment proof):
+   - experience_certificates: Employment certificates, experience letters, service certificates,
+     work reference letters, relieving letters, employment verification, NOC from employer
+   
+   👮 POLICE CLEARANCE:
+   - police_character_certificate: Police clearance certificate, character certificate,
+     background check, PCC, police verification
+   
+   📜 PROFESSIONAL CERTIFICATES (skill/industry certifications):
+   - certificates: CCNA, AWS, PMP, Microsoft certifications, Cisco certifications,
+     professional licenses, industry skill certifications, IT certifications
+     (NOT academic degrees, NOT NAVTTC, NOT employment letters)
+   
+   📄 OTHER CATEGORIES:
    - cv_resume: CV, resume, curriculum vitae
    - passport: Passport copy, passport scan
    - cnic: Pakistani CNIC (National ID Card)
    - driving_license: Driving license or driver's license
-   - police_character_certificate: Police character certificate or clearance certificate
-   - certificates: Educational certificates, degrees, diplomas, training certificates
    - contracts: Employment contracts, offer letters, agreements
    - medical_reports: Medical test reports, health certificates, fitness certificates
    - photos: Passport photos, ID photos
@@ -142,7 +211,13 @@ VISION_LAYOUT_PROMPT = """You are a document layout and classification AI. Analy
    Example: passport on top 50%%, medical on bottom 50%% -> regions: [{"top_pct": 0, "height_pct": 0.5, "doc_type": "passport"}, {"top_pct": 0.5, "height_pct": 0.5, "doc_type": "medical_reports"}]
    Use non-overlapping, adjacent bands. Min height_pct 0.08 per region.
 
-4. Categories: cv_resume, passport, cnic, driving_license, police_character_certificate, certificates, contracts, medical_reports, photos, other_documents.
+4. Categories (BE SPECIFIC):
+   - educational_documents: University degrees, diplomas, transcripts, academic certificates
+   - experience_certificates: Employment certificates, experience letters, service certificates
+   - navttc_reports: NAVTTC vocational training, government technical training
+   - police_character_certificate: Police clearance, character certificates
+   - certificates: Professional/IT certifications ONLY (CCNA, AWS, PMP, etc.)
+   - cv_resume, passport, cnic, driving_license, contracts, medical_reports, photos, other_documents
 
 5. Identity: name, father_name, cnic, passport_no, email, phone, date_of_birth, document_number, nationality, passport_expiry, expiry_date, issue_date, place_of_issue.
 
