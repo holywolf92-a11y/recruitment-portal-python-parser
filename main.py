@@ -104,6 +104,19 @@ class ParseResponse(BaseModel):
     data: Optional[dict] = None
     error: Optional[str] = None
 
+
+class ExtractPhotoRequest(BaseModel):
+    file_content: str
+    attachment_id: str
+    file_name: Optional[str] = None
+    mime_type: Optional[str] = None
+
+
+class ExtractPhotoResponse(BaseModel):
+    success: bool
+    profile_photo_url: Optional[str] = None
+    error: Optional[str] = None
+
 def verify_hmac(signature: str, body: bytes) -> bool:
     """Verify HMAC signature"""
     try:
@@ -1706,7 +1719,7 @@ def detect_faces_with_mediapipe(image: Image.Image) -> list:
         logger.warning(f"[FACE_DETECT] Face detection failed: {e}")
         return []
 
-def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Optional[str]:
+def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str, max_pages: int = 3) -> Optional[str]:
     """
     Extract profile photo from PDF using face-recognition ML library (Phase C).
     
@@ -1723,84 +1736,95 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
         
         logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=START")
         
-        # Step 1: Render PDF to image
+        # Step 1: Render PDF pages to images (scan first N pages)
         pdf_document = fitz.open(stream=pdf_content, filetype="pdf")
         if pdf_document.page_count == 0:
             logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=NO_PAGES")
             return None
-        
-        # Get first page and render to high-quality image
-        first_page = pdf_document[0]
-        pix = first_page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom for better detection
-        img_data = pix.tobytes("png")
-        pil_img = Image.open(io.BytesIO(img_data))
+
+        best_face_crop = None
+        best_face_area = 0
+
+        pages_to_scan = min(max_pages, pdf_document.page_count)
+        for page_index in range(pages_to_scan):
+            page = pdf_document[page_index]
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom for better detection
+            img_data = pix.tobytes("png")
+            pil_img = Image.open(io.BytesIO(img_data))
+
+            w, h = pil_img.size
+            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} page_rendered page={page_index+1} dims={w}x{h}")
+
+            # Step 2: Detect faces with real ML (face-recognition library)
+            img_array = np.array(pil_img)
+            face_locations = face_recognition.face_locations(img_array, model="hog")
+
+            if not face_locations:
+                continue
+
+            logger.info(f"[FACE_DETECT] Found {len(face_locations)} face(s) using ML on page={page_index+1}")
+
+            # Sort by area desc to prefer the main headshot
+            def _area(loc):
+                t, r, b, l = loc
+                return max(0, (r - l)) * max(0, (b - t))
+
+            face_locations.sort(key=_area, reverse=True)
+
+            for loc in face_locations[:3]:
+                top, right, bottom, left = loc
+                face_width = right - left
+                face_height = bottom - top
+                face_area = max(0, face_width) * max(0, face_height)
+
+                # Step 3: Quality checks
+                if face_width < 50 or face_height < 50:
+                    continue
+
+                padding = int(max(face_width, face_height) * 0.20)
+                x1 = max(0, left - padding)
+                y1 = max(0, top - padding)
+                x2 = min(w, right + padding)
+                y2 = min(h, bottom + padding)
+
+                face_crop = pil_img.crop((x1, y1, x2, y2))
+
+                if is_image_blurry(face_crop, threshold=100):
+                    continue
+
+                is_bad_brightness, brightness_reason = is_image_too_dark_or_bright(face_crop)
+                if is_bad_brightness:
+                    continue
+
+                if face_area > best_face_area:
+                    best_face_area = face_area
+                    best_face_crop = face_crop
+
+            # If we found a decent face on this page, keep scanning remaining pages
+            # in case there's a larger/clearer one.
+
         pdf_document.close()
-        
-        w, h = pil_img.size
-        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} page_rendered dims={w}x{h}")
-        
-        # Step 2: Detect faces with real ML (face-recognition library)
-        img_array = np.array(pil_img)
-        face_locations = face_recognition.face_locations(img_array, model="hog")  # HOG is faster, CNN is more accurate
-        
-        if not face_locations:
+
+        if best_face_crop is None:
             logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=NO_FACES_DETECTED")
             return None
-        
-        logger.info(f"[FACE_DETECT] Found {len(face_locations)} face(s) using ML")
-        
-        # Get the first (usually largest/best) face
-        # face_locations returns (top, right, bottom, left)
-        top, right, bottom, left = face_locations[0]
-        face_width = right - left
-        face_height = bottom - top
-        
-        logger.info(f"[FACE_DETECT] Best face at ({left},{top}) size={face_width}x{face_height}")
-        
-        # Step 3: Quality checks
-        # 3a. Check face size (reject if too small)
-        if face_width < 50 or face_height < 50:
-            logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=FACE_TOO_SMALL dims={face_width}x{face_height}")
-            return None
-        
-        # 3b. Crop face with padding
-        padding = int(max(face_width, face_height) * 0.20)  # 20% padding
-        x1 = max(0, left - padding)
-        y1 = max(0, top - padding)
-        x2 = min(w, right + padding)
-        y2 = min(h, bottom + padding)
-        
-        face_crop = pil_img.crop((x1, y1, x2, y2))
-        
-        # 3c. Blur check
-        if is_image_blurry(face_crop, threshold=100):
-            logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=BLURRY")
-            return None
-        
-        # 3d. Brightness check
-        is_bad_brightness, brightness_reason = is_image_too_dark_or_bright(face_crop)
-        if is_bad_brightness:
-            logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason={brightness_reason}")
-            return None
-        
+
         # Step 4: Standardize to square 512x512
         target_size = 512
-        crop_w, crop_h = face_crop.size
-        
+        crop_w, crop_h = best_face_crop.size
+
+        face_crop = best_face_crop
         if crop_w != crop_h:
-            # Pad to square with white background
             max_dim = max(crop_w, crop_h)
             square_img = Image.new('RGB', (max_dim, max_dim), (255, 255, 255))
             x_offset = (max_dim - crop_w) // 2
             y_offset = (max_dim - crop_h) // 2
             square_img.paste(face_crop, (x_offset, y_offset))
             face_crop = square_img
-        
-        # Resize to 512x512
+
         face_crop = face_crop.resize((target_size, target_size), Image.Resampling.LANCZOS)
-        
         logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} face_ready size={target_size}x{target_size}")
-        
+
         # Step 5: Convert to JPEG and upload
         buffer = io.BytesIO()
         face_crop.save(buffer, format='JPEG', quality=95)
@@ -1826,6 +1850,32 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str) -> Op
         import traceback
         logger.warning(f"[PHOTO_EXTRACT] traceback={traceback.format_exc()}")
         return None  # Graceful fallback - don't fail CV parsing if photo extraction fails
+
+
+@app.post("/extract-photo", response_model=ExtractPhotoResponse)
+async def extract_photo(
+    request: Request,
+    extract_request: ExtractPhotoRequest,
+    x_hmac_signature: str = Header(None)
+):
+    """Extract only the profile photo from a PDF (base64 bytes) and return profile_photo_url."""
+
+    if not x_hmac_signature:
+        return ExtractPhotoResponse(success=False, error="Missing HMAC signature")
+
+    body = await request.body()
+    if not verify_hmac(x_hmac_signature, body):
+        return ExtractPhotoResponse(success=False, error="Invalid HMAC signature")
+
+    try:
+        pdf_bytes = base64.b64decode(extract_request.file_content)
+        url = extract_profile_photo_from_pdf(pdf_bytes, extract_request.attachment_id)
+        if not url:
+            return ExtractPhotoResponse(success=True, profile_photo_url=None)
+        return ExtractPhotoResponse(success=True, profile_photo_url=url)
+    except Exception as e:
+        logger.error(f"[ExtractPhoto] Error: {e}")
+        return ExtractPhotoResponse(success=False, error=str(e))
 
 def upload_photo_to_supabase(image_bytes: bytes, attachment_id: str, file_ext: str) -> str:
     """Upload extracted photo to Supabase Storage bucket using supabase-py client"""
