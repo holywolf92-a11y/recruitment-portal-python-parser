@@ -1719,7 +1719,7 @@ def detect_faces_with_mediapipe(image: Image.Image) -> list:
         logger.warning(f"[FACE_DETECT] Face detection failed: {e}")
         return []
 
-def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str, max_pages: int = 3) -> Optional[str]:
+def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str, max_pages: int = 5) -> Optional[str]:
     """
     Extract profile photo from PDF using face-recognition ML library (Phase C).
     
