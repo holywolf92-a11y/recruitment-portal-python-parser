@@ -917,6 +917,35 @@ async def run_split_and_categorize(
                 page_idx, img_bytes, pdf_bytes, is_pdf, openai_api_key, documents
             )
 
+    # Heuristic: if the upload is mostly a passport, treat nearby low-confidence other_documents pages
+    # as passport too (common when users scan blank passport pages).
+    try:
+        page_docs = [d for d in documents if (d.get("split_strategy") or "page") == "page"]
+        passport_docs = [d for d in page_docs if d.get("doc_type") == "passport"]
+        if page_docs and passport_docs:
+            passport_ratio = len(passport_docs) / max(1, len(page_docs))
+            if passport_ratio >= 0.5:
+                passport_pages = set()
+                for d in passport_docs:
+                    for p in (d.get("pages") or []):
+                        passport_pages.add(int(p))
+
+                for d in page_docs:
+                    if d.get("doc_type") != "other_documents":
+                        continue
+                    conf = float(d.get("confidence") or 0.0)
+                    if conf >= 0.6:
+                        continue
+                    pages_list = d.get("pages") or []
+                    if not pages_list:
+                        continue
+                    p0 = int(pages_list[0])
+                    if any(abs(p0 - pp) <= 2 for pp in passport_pages):
+                        d["doc_type"] = "passport"
+                        d["needs_review"] = True
+    except Exception as e:
+        logger.warning(f"[Split] Passport page promotion heuristic failed: {e}")
+
     # Phase 2: group consecutive full-page units (same doc_type) -> one PDF per group, split_strategy "grouped"
     documents = group_consecutive_pages(documents, pdf_bytes, is_pdf)
 
