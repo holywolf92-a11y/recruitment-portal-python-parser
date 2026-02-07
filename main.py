@@ -47,7 +47,7 @@ from enhance_nationality import enhance_nationality_with_ai
 CV2_AVAILABLE = True  # We can do face detection with PIL + scipy
 CV2_FALLBACK_AVAILABLE = False
 
-app = FastAPI(title="CV Parser Service", version="2.1.1-bugfix-pil-bytes")
+app = FastAPI(title="CV Parser Service", version="2.2.0-multi-format-support")
 
 # CORS middleware
 app.add_middleware(
@@ -982,15 +982,107 @@ async def parse_cv_with_vision(file_content: bytes, filename: str, max_pages: in
         logger.error(f"OpenAI vision parsing error: {e}")
         raise HTTPException(status_code=500, detail=f"CV vision parsing failed: {str(e)}")
 
+
+async def parse_cv_with_vision_image(file_content: bytes, filename: str, image_format: str) -> dict:
+    """
+    Parse CV directly from image file (JPEG, PNG, GIF, WebP, BMP) using OpenAI Vision
+    No PDF conversion needed - sends image directly to Vision API
+    
+    Args:
+        file_content: Raw image bytes
+        filename: Original filename (for logging)
+        image_format: Image format ('jpeg', 'png', 'gif', 'webp', 'bmp')
+    
+    Returns:
+        Parsed CV data dictionary
+    """
+    try:
+        import base64
+        
+        logger.info(f"[CVVisionImage] Processing {image_format.upper()} image: {filename}")
+        
+        # Helper functions
+        def strip_code_fences(text: str) -> str:
+            t = text.strip()
+            if t.startswith("```json"):
+                t = t[7:]
+            if t.startswith("```"):
+                t = t[3:]
+            if t.endswith("```"):
+                t = t[:-3]
+            return t.strip()
+        
+        # Encode image as base64
+        img_base64 = base64.b64encode(file_content).decode('utf-8')
+        
+        # Map format to MIME type
+        mime_type_map = {
+            'jpeg': 'image/jpeg',
+            'png': 'image/png',
+            'gif': 'image/gif',
+            'webp': 'image/webp',
+            'bmp': 'image/bmp'
+        }
+        mime_type = mime_type_map.get(image_format, 'image/jpeg')
+        
+        # Create image payload for Vision API
+        images = [{
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime_type};base64,{img_base64}"}
+        }]
+        
+        logger.info(f"[CVVisionImage] Encoded {image_format.upper()} image ({len(img_base64)} chars base64)")
+        
+        # Build CV parsing prompt
+        prompt = build_cv_prompt("", from_images=True)
+        
+        # Call OpenAI Vision API
+        response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are a precise CV parser that returns only valid JSON."},
+                {"role": "user", "content": [{"type": "text", "text": prompt}, *images]},
+            ],
+            temperature=0.1,
+            max_tokens=2000,
+        )
+        
+        result_text = strip_code_fences(response.choices[0].message.content or "")
+        parsed_data = json.loads(result_text)
+        parsed_data = post_process_cv_parsed_data(parsed_data)
+        
+        # ENHANCED: Use AI to infer nationality from education/work experience if not explicitly stated
+        try:
+            parsed_data = enhance_nationality_with_ai(parsed_data)
+            if parsed_data.get('nationality_inferred_from'):
+                logger.info(f"[CVVisionImage] Nationality inference: {parsed_data.get('nationality')} (from {parsed_data.get('nationality_inferred_from')})")
+        except Exception as e:
+            logger.warning(f"[CVVisionImage] Could not enhance nationality detection: {e}")
+        
+        logger.info(f"[CVVisionImage] Successfully parsed CV from {image_format.upper()} image")
+        return parsed_data
+        
+    except Exception as e:
+        logger.error(f"[CVVisionImage] Image CV parsing error: {e}")
+        raise HTTPException(status_code=500, detail=f"CV image parsing failed: {str(e)}")
+
+
 @app.get("/")
 async def root():
     """Root endpoint"""
     return {
         "service": "CV Parser",
-        "version": "2.1.1-bugfix-pil-bytes",
+        "version": "2.2.0-multi-format-support",
         "status": "running",
         "environment": ENVIRONMENT,
-        "features": ["embedded-image-extraction", "jpeg-conversion", "enhanced-logging"]
+        "features": [
+            "embedded-image-extraction",
+            "jpeg-conversion",
+            "enhanced-logging",
+            "multi-format-cv-support",
+            "pdf-image-fallback",
+            "direct-image-processing"
+        ]
     }
 
 @app.get("/health")
@@ -998,12 +1090,13 @@ async def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "version": "2.1.1-bugfix-pil-bytes",
+        "version": "2.2.0-multi-format-support",
         "timestamp": datetime.utcnow().isoformat(),
         "openai_configured": bool(OPENAI_API_KEY),
         "hmac_configured": bool(HMAC_SECRET),
         "photo_jpeg_enabled": True,
-        "embedded_image_extraction": True
+        "embedded_image_extraction": True,
+        "supported_formats": ["pdf", "jpeg", "png", "gif", "webp", "bmp"]
     }
 
 @app.post("/categorize-document")
@@ -1184,12 +1277,58 @@ async def parse_cv(
             error=str(e)
         )
 
+def detect_file_type(file_content: bytes) -> str:
+    """
+    Detect file type from magic bytes (file header signature)
+    Returns: 'pdf', 'jpeg', 'png', 'gif', 'webp', 'bmp', or 'unknown'
+    """
+    if len(file_content) < 4:
+        return 'unknown'
+    
+    # Check magic bytes
+    header = file_content[:4]
+    
+    # PDF: %PDF (0x25 0x50 0x44 0x46)
+    if header[0] == 0x25 and header[1] == 0x50 and header[2] == 0x44 and header[3] == 0x46:
+        return 'pdf'
+    
+    # JPEG: FF D8
+    if header[0] == 0xFF and header[1] == 0xD8:
+        return 'jpeg'
+    
+    # PNG: 89 50 4E 47
+    if header[0] == 0x89 and header[1] == 0x50 and header[2] == 0x4E and header[3] == 0x47:
+        return 'png'
+    
+    # GIF: 47 49 46
+    if header[0] == 0x47 and header[1] == 0x49 and header[2] == 0x46:
+        return 'gif'
+    
+    # WebP: check for RIFF + WEBP signature
+    if len(file_content) >= 12:
+        if (header[0] == 0x52 and header[1] == 0x49 and header[2] == 0x46 and header[3] == 0x46 and
+            file_content[8] == 0x57 and file_content[9] == 0x45 and file_content[10] == 0x42 and file_content[11] == 0x50):
+            return 'webp'
+    
+    # BMP: 42 4D
+    if header[0] == 0x42 and header[1] == 0x4D:
+        return 'bmp'
+    
+    return 'unknown'
+
+
 @app.post("/parse-cv")
 async def parse_cv_from_url(
     request: Request,
     x_signature: str = Header(None)
 ):
-    """Parse CV from URL - backend worker endpoint"""
+    """
+    Parse CV from URL - backend worker endpoint with smart fallback
+    
+    Supports:
+    - PDF files (text extraction → Vision fallback)
+    - Image files (JPEG, PNG, GIF, WebP, BMP) → Direct Vision API processing
+    """
 
     # Verify HMAC signature
     if not x_signature:
@@ -1215,27 +1354,83 @@ async def parse_cv_from_url(
             response.raise_for_status()
             file_content = response.content
 
-        # Extract text from PDF
-        text_content = extract_text_from_pdf(file_content)
-        
-        # PHASE C COMPLETE: Real ML-based face detection enabled!  
-        # Using face-recognition library with dlib HOG detector
-        # No more false positives (text regions detected as faces)
-        profile_photo_url = extract_profile_photo_from_pdf(file_content, attachment_id or "unknown")
-        
-        # Parse with OpenAI (fallback to Vision when text extraction is weak or placeholder detected)
-        used_vision = False
-        if len(text_content.strip()) < 200:
-            logger.warning(f"[CVParse] Low text extracted ({len(text_content)} chars). Using Vision parsing.")
-            parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
-            used_vision = True
-        else:
-            parsed_data = await parse_cv_with_openai(text_content, attachment_id or "unknown")
+        # Detect file type
+        file_type = detect_file_type(file_content)
+        logger.info(f"[CVParse] Detected file type: {file_type}")
 
-        if not used_vision and looks_placeholder_cv(parsed_data):
-            logger.warning("[CVParse] Placeholder data detected. Retrying with Vision parsing.")
-            parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
-            used_vision = True
+        # Initialize variables
+        text_content = ""
+        profile_photo_url = None
+        used_vision = False
+        parsed_data = None
+
+        # Strategy 1: Try PDF extraction if it's a PDF
+        if file_type == 'pdf':
+            try:
+                text_content = extract_text_from_pdf(file_content)
+                
+                # PHASE C COMPLETE: Real ML-based face detection enabled!
+                profile_photo_url = extract_profile_photo_from_pdf(file_content, attachment_id or "unknown")
+                
+                # Parse with OpenAI (fallback to Vision when text extraction is weak)
+                if len(text_content.strip()) < 200:
+                    logger.warning(f"[CVParse] Low text extracted ({len(text_content)} chars). Using Vision parsing.")
+                    parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
+                    used_vision = True
+                else:
+                    parsed_data = await parse_cv_with_openai(text_content, attachment_id or "unknown")
+                
+                # Check for placeholder data
+                if not used_vision and looks_placeholder_cv(parsed_data):
+                    logger.warning("[CVParse] Placeholder data detected. Retrying with Vision parsing.")
+                    parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
+                    used_vision = True
+                    
+            except Exception as pdf_error:
+                logger.error(f"[CVParse] PDF extraction failed: {pdf_error}")
+                logger.warning("[CVParse] PDF extraction failed. Trying Vision API fallback...")
+                # Fallback to Vision API for corrupted/scanned PDFs
+                try:
+                    parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
+                    used_vision = True
+                except Exception as vision_error:
+                    logger.error(f"[CVParse] Vision API fallback also failed: {vision_error}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to parse PDF with both text extraction and Vision API: {str(pdf_error)}"
+                    )
+        
+        # Strategy 2: If it's an image, go directly to Vision API
+        elif file_type in ['jpeg', 'png', 'gif', 'webp', 'bmp']:
+            logger.info(f"[CVParse] Image file detected ({file_type}). Using Vision API directly.")
+            try:
+                # Use existing Vision API parsing with is_pdf=False flag
+                parsed_data = await parse_cv_with_vision_image(file_content, attachment_id or "unknown", file_type)
+                used_vision = True
+            except Exception as vision_error:
+                logger.error(f"[CVParse] Vision API processing failed for image: {vision_error}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to parse image CV with Vision API: {str(vision_error)}"
+                )
+        
+        # Strategy 3: Unknown file type - try Vision API as last resort
+        else:
+            logger.warning(f"[CVParse] Unknown file type. Attempting Vision API as last resort...")
+            try:
+                # Try as PDF first
+                parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
+                used_vision = True
+            except Exception as e:
+                logger.error(f"[CVParse] Failed to parse unknown file type: {e}")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unsupported file format. Please upload a PDF or image file (JPEG, PNG, GIF, WebP, BMP)."
+                )
+        
+        # Ensure we have parsed data
+        if not parsed_data:
+            raise HTTPException(status_code=500, detail="Failed to extract any CV data")
         
         # Add profile photo URL to parsed data if extracted
         if profile_photo_url:
