@@ -1404,9 +1404,13 @@ async def parse_cv_from_url(
         elif file_type in ['jpeg', 'png', 'gif', 'webp', 'bmp']:
             logger.info(f"[CVParse] Image file detected ({file_type}). Using Vision API directly.")
             try:
-                # Use existing Vision API parsing with is_pdf=False flag
+                # Parse CV content with Vision API
                 parsed_data = await parse_cv_with_vision_image(file_content, attachment_id or "unknown", file_type)
                 used_vision = True
+                
+                # Extract profile photo from the image (face detection)
+                profile_photo_url = extract_profile_photo_from_image(file_content, attachment_id or "unknown")
+                
             except Exception as vision_error:
                 logger.error(f"[CVParse] Vision API processing failed for image: {vision_error}")
                 raise HTTPException(
@@ -1913,6 +1917,128 @@ def detect_faces_with_mediapipe(image: Image.Image) -> list:
     except Exception as e:
         logger.warning(f"[FACE_DETECT] Face detection failed: {e}")
         return []
+
+def extract_profile_photo_from_image(image_content: bytes, attachment_id: str) -> Optional[str]:
+    """
+    Extract profile photo from image file (JPEG, PNG, etc.) using face-recognition ML library.
+    
+    Pipeline:
+    1. Load image directly (no PDF rendering needed)
+    2. Detect faces using face-recognition (dlib HOG)
+    3. Quality checks (blur, brightness, size)
+    4. Smart cropping and upload
+    
+    Returns the signed URL of the uploaded photo, or None if no photo found.
+    """
+    try:
+        import face_recognition
+        
+        logger.info(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} action=START")
+        
+        # Step 1: Load image directly
+        pil_img = Image.open(io.BytesIO(image_content))
+        
+        # Convert to RGB if needed (PNG might have alpha channel)
+        if pil_img.mode != 'RGB':
+            pil_img = pil_img.convert('RGB')
+        
+        w, h = pil_img.size
+        logger.info(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} image_loaded dims={w}x{h}")
+        
+        # Step 2: Detect faces with real ML (face-recognition library)
+        img_array = np.array(pil_img)
+        face_locations = face_recognition.face_locations(img_array, model="hog")
+        
+        if not face_locations:
+            logger.info(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} action=SKIP reason=NO_FACES_DETECTED")
+            return None
+        
+        logger.info(f"[FACE_DETECT] Found {len(face_locations)} face(s) using ML on image")
+        
+        # Sort by area desc to prefer the main headshot
+        def _area(loc):
+            t, r, b, l = loc
+            return max(0, (r - l)) * max(0, (b - t))
+        
+        face_locations.sort(key=_area, reverse=True)
+        
+        best_face_crop = None
+        best_face_area = 0
+        
+        for loc in face_locations[:3]:
+            top, right, bottom, left = loc
+            face_width = right - left
+            face_height = bottom - top
+            face_area = max(0, face_width) * max(0, face_height)
+            
+            # Step 3: Quality checks
+            if face_width < 50 or face_height < 50:
+                continue
+            
+            padding = int(max(face_width, face_height) * 0.20)
+            x1 = max(0, left - padding)
+            y1 = max(0, top - padding)
+            x2 = min(w, right + padding)
+            y2 = min(h, bottom + padding)
+            
+            face_crop = pil_img.crop((x1, y1, x2, y2))
+            
+            if is_image_blurry(face_crop, threshold=100):
+                continue
+            
+            is_bad_brightness, brightness_reason = is_image_too_dark_or_bright(face_crop)
+            if is_bad_brightness:
+                continue
+            
+            if face_area > best_face_area:
+                best_face_area = face_area
+                best_face_crop = face_crop
+        
+        if best_face_crop is None:
+            logger.info(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} action=SKIP reason=NO_QUALITY_FACES")
+            return None
+        
+        # Step 4: Standardize to square 512x512
+        target_size = 512
+        crop_w, crop_h = best_face_crop.size
+        
+        face_crop = best_face_crop
+        if crop_w != crop_h:
+            max_dim = max(crop_w, crop_h)
+            square_img = Image.new('RGB', (max_dim, max_dim), (255, 255, 255))
+            x_offset = (max_dim - crop_w) // 2
+            y_offset = (max_dim - crop_h) // 2
+            square_img.paste(face_crop, (x_offset, y_offset))
+            face_crop = square_img
+        
+        face_crop = face_crop.resize((target_size, target_size), Image.Resampling.LANCZOS)
+        logger.info(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} face_ready size={target_size}x{target_size}")
+        
+        # Step 5: Convert to JPEG and upload
+        buffer = io.BytesIO()
+        face_crop.save(buffer, format='JPEG', quality=95)
+        photo_bytes = buffer.getvalue()
+        
+        # Upload to Supabase (will return signed URL)
+        photo_url = upload_photo_to_supabase(photo_bytes, attachment_id, "jpg")
+        
+        if photo_url:
+            logger.info(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} SUCCESS uploaded_as={photo_url}")
+        else:
+            logger.warning(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} action=SKIP reason=UPLOAD_FAILED")
+        
+        return photo_url
+        
+    except ImportError as e:
+        logger.warning(f"[PHOTO_EXTRACT_IMG] face-recognition library not available: {e}")
+        return None
+        
+    except Exception as e:
+        logger.warning(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} extraction_failed error={e}")
+        import traceback
+        logger.warning(f"[PHOTO_EXTRACT_IMG] traceback={traceback.format_exc()}")
+        return None  # Graceful fallback
+
 
 def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str, max_pages: int = 5) -> Optional[str]:
     """
