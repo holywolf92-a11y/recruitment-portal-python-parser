@@ -423,7 +423,9 @@ Return ONLY valid JSON:
         raise HTTPException(status_code=500, detail=f"Document categorization failed: {str(e)}")
 
 def build_cv_prompt(content: str, from_images: bool = False) -> str:
-    content_section = "CV Images are attached." if from_images else f"CV Content:\n{content[:4000]}"
+    # Do not aggressively truncate text-based PDFs; later pages often contain
+    # education, licenses/registrations, and detailed experience.
+    content_section = "CV Images are attached." if from_images else f"CV Content:\n{content[:20000]}"
     return f"""
 You are a CV/Resume parser. Extract structured information from the following CV content.
 Return ONLY valid JSON with these exact fields (use null for missing data):
@@ -462,9 +464,19 @@ Return ONLY valid JSON with these exact fields (use null for missing data):
       "institution": "string (REQUIRED - full university/college name, e.g., 'COMSATS UNIVERSITY ISLAMABAD')",
       "location": "string or null (city and country, e.g., 'Abbottabad, Pakistan')",
       "graduation_date": "string or null (year or date range, e.g., '2020-2024', '2024', 'Aug 2024')",
-      "cgpa": "string or null (GPA/CGPA if mentioned, e.g., '3.01/4.00', '3.5')"
+            "cgpa": "string or null (GPA/CGPA if mentioned, e.g., '3.01/4.00', '3.5')",
+            "thesis": "string or null (if mentioned, keep verbatim)"
     }}
   ],
+    "licenses": [
+        {{
+            "authority": "string (e.g., 'CORU', 'Allied Health Professionals Council Pakistan', 'Pakistan Physical Therapy Association (PPTA)')",
+            "registration_no": "string or null (keep numbers verbatim)",
+            "country": "string or null",
+            "expiry_date": "string or null (year/date if available)",
+            "notes": "string or null"
+        }}
+    ],
   "certifications": ["array of strings"],
   "languages": ["array of strings"],
   "previous_employment": "string or null (brief summary of work history)",
@@ -537,7 +549,7 @@ def post_process_cv_parsed_data(parsed_data: dict) -> dict:
     ]
     course_keywords = [
         'course', 'certification', 'certificate', 'workshop', 'seminar', 
-        'student', 'coursework', 'online course', 'certification program',
+        'coursework', 'online course', 'certification program',
         'diploma', 'certification course', 'professional course', 'training program'
     ]
     
@@ -623,7 +635,7 @@ async def parse_cv_with_openai(content: str, filename: str) -> dict:
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1,
-            max_tokens=2000
+            max_tokens=3500
         )
 
         result_text = response.choices[0].message.content.strip()
@@ -639,6 +651,12 @@ async def parse_cv_with_openai(content: str, filename: str) -> dict:
         result_text = result_text.strip()
         parsed_data = json.loads(result_text)
         parsed_data = post_process_cv_parsed_data(parsed_data)
+
+        # Evidence/audit trail for downstream completeness guards.
+        # Keep truncated to avoid oversized payloads.
+        if isinstance(content, str) and content:
+            parsed_data['raw_text_length'] = len(content)
+            parsed_data['raw_text'] = content[:20000]
         
         # Post-processing: Normalize driver positions
         position = parsed_data.get('position', '').strip() if parsed_data.get('position') else ''
@@ -658,83 +676,23 @@ async def parse_cv_with_openai(content: str, filename: str) -> dict:
                     parsed_data['position'] = 'Driver'
                 logger.info(f"Normalized position from '{position}' to '{parsed_data['position']}'")
 
-        # Post-processing: Normalize education list into a readable string
+        # Keep education as a structured array (do not collapse to string).
         education_entries = parsed_data.get('education')
-        if isinstance(education_entries, list) and len(education_entries) > 0:
-            formatted_education = []
-            for edu in education_entries:
-                if not isinstance(edu, dict):
-                    continue
-                degree = (edu.get('degree') or '').strip()
-                institution = (edu.get('institution') or '').strip()
-                location = (edu.get('location') or '').strip()
-                graduation_date = (edu.get('graduation_date') or '').strip()
-                cgpa = (edu.get('cgpa') or '').strip()
-
-                parts = []
-                if degree:
-                    parts.append(degree)
-                if institution:
-                    parts.append(institution)
-                if location:
-                    parts.append(location)
-                if graduation_date:
-                    parts.append(graduation_date)
-                if cgpa:
-                    parts.append(f"CGPA: {cgpa}" if not cgpa.startswith('CGPA') else cgpa)
-
-                if parts:
-                    formatted_education.append(' - '.join(parts))
-
-            parsed_data['education'] = ' | '.join(formatted_education) if formatted_education else None
-        else:
-            # If education is empty array or not a list, try fallback extraction
-            parsed_data['education'] = None
-            
-            # Fallback: Search for education patterns in original content
-            if not parsed_data.get('education') and content:
-                import re
-                education_keywords = [
-                    r'BS\s+[\w\s]+Engineering',
-                    r'B\.?Sc\.?\s+[\w\s]+',
-                    r'Bachelor\s+of\s+[\w\s]+',
-                    r'Master\s+of\s+[\w\s]+',
-                    r'M\.?Sc\.?\s+[\w\s]+',
-                    r'MBA\s+[\w\s]*',
-                    r'Intermediate\s+[\w\s]*',
-                    r'F\.?Sc\.?\s+[\w\s]*',
-                    r'Matric\s+[\w\s]*',
-                    r'Diploma\s+in\s+[\w\s]+'
-                ]
-                
-                university_keywords = [
-                    r'COMSATS\s+UNIVERSITY[^.\n]*',
-                    r'University\s+of\s+[\w\s]+',
-                    r'Institute\s+of\s+[\w\s]+',
-                    r'College\s+of\s+[\w\s]+'
-                ]
-                
-                found_education = []
-                content_upper = content.upper()
-                
-                # Look for education section
-                if 'EDUCATION' in content_upper or 'ACADEMIC' in content_upper or 'QUALIFICATION' in content_upper:
-                    for keyword_pattern in education_keywords:
-                        matches = re.findall(keyword_pattern, content, re.IGNORECASE)
-                        if matches:
-                            found_education.extend(matches)
-                    
-                    for uni_pattern in university_keywords:
-                        matches = re.findall(uni_pattern, content, re.IGNORECASE)
-                        if matches:
-                            found_education.extend(matches)
-                
-                if found_education:
-                    # Deduplicate and clean
-                    unique_edu = list(set([e.strip() for e in found_education if len(e.strip()) > 5]))
-                    if unique_edu:
-                        parsed_data['education'] = ' | '.join(unique_edu[:3])  # Limit to first 3
-                        logger.info(f"Fallback education extraction found: {parsed_data['education']}")
+        if isinstance(education_entries, str) and education_entries.strip():
+            parsed_data['education'] = [
+                {
+                    'degree': education_entries.strip(),
+                    'institution': '',
+                    'location': None,
+                    'graduation_date': None,
+                    'cgpa': None,
+                    'thesis': None,
+                }
+            ]
+        elif education_entries is None:
+            parsed_data['education'] = []
+        elif not isinstance(education_entries, list):
+            parsed_data['education'] = []
         
         # Post-processing: Calculate GCC years from work experience
         gcc_countries = ['saudi arabia', 'uae', 'united arab emirates', 'qatar', 'kuwait', 
@@ -797,8 +755,7 @@ async def parse_cv_with_openai(content: str, filename: str) -> dict:
                 end_date = exp.get('end_date') or 'Present'
 
                 if not start_date:
-                    # No dates available - estimate 1 year for this role
-                    total_experience_years += 1
+                    # No explicit dates available - do not guess duration.
                     continue
 
                 try:
@@ -819,10 +776,9 @@ async def parse_cv_with_openai(content: str, filename: str) -> dict:
 
                     if start_year and end_year:
                         total_experience_years += max(0, end_year - start_year)
-                    else:
-                        total_experience_years += 1
                 except (ValueError, AttributeError):
-                    total_experience_years += 1
+                    # Date parsing failed - do not guess duration.
+                    continue
 
         if total_experience_years > 0:
             try:
@@ -830,7 +786,7 @@ async def parse_cv_with_openai(content: str, filename: str) -> dict:
             except (TypeError, ValueError):
                 existing_experience = None
 
-            if existing_experience is None or total_experience_years > existing_experience:
+            if existing_experience is None:
                 parsed_data['experience_years'] = total_experience_years
                 logger.info(f"Calculated total experience_years: {total_experience_years} from work experience")
         
