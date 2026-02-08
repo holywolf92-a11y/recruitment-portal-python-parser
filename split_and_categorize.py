@@ -130,6 +130,13 @@ def normalize_doc_type(category: str) -> str:
 
 VISION_PROMPT = """You are a document classification and identity extraction AI. Analyze this SINGLE page image and provide:
 
+CRITICAL CV vs STANDALONE DOCUMENT RULE:
+- If the page is clearly part of a CV/resume (sections like Education/Experience/Skills/Languages, bullet lists, job history, profile summary, tables of responsibilities), classify as "cv_resume".
+- Do NOT classify a CV page as "educational_documents" just because it mentions degrees/schools/CGPA.
+- Do NOT classify a CV page as "experience_certificates" just because it lists employers/job titles.
+- Only use "educational_documents" when the page is an official standalone credential (degree/transcript/marksheet) with institution header, stamps/seals, signatures, roll/registration numbers, or transcript-style course/grades table.
+- Only use "experience_certificates" when the page is an official employer letter/certificate (letterhead, “To whom it may concern”, “This is to certify…”, dates of employment, stamp/signature).
+
 1. Document category (choose ONE - BE SPECIFIC):
    
    🎓 EDUCATIONAL DOCUMENTS (academic qualifications):
@@ -200,6 +207,12 @@ Return ONLY valid JSON:
 """
 
 VISION_LAYOUT_PROMPT = """You are a document layout and classification AI. Analyze this page image.
+
+CRITICAL CV vs STANDALONE DOCUMENT RULE:
+- If this page is clearly part of a CV/resume (sections like Education/Experience/Skills/Languages, bullet lists, job history, profile summary), choose category "cv_resume".
+- Do NOT label CV pages as "educational_documents" or "experience_certificates" based on section headings.
+- Only use "educational_documents" for official standalone academic credentials (degree/transcript/marksheet) with institutional formatting, stamps/seals, signatures, roll/registration numbers, or course/grade tables.
+- Only use "experience_certificates" for official employer letters/certificates with letterhead and stamp/signature.
 
 1. LAYOUT: Is this page a SINGLE document (whole page) or MULTIPLE distinct documents (e.g. passport top, medical bottom)?
    - "single": one document fills the page
@@ -945,6 +958,36 @@ async def run_split_and_categorize(
                         d["needs_review"] = True
     except Exception as e:
         logger.warning(f"[Split] Passport page promotion heuristic failed: {e}")
+
+    # Heuristic: prevent CV sections from being split into standalone docs.
+    # If many pages are classified as cv_resume, then nearby low/medium-confidence
+    # educational/experience/professional certificate pages are likely CV sections.
+    try:
+        page_docs = [d for d in documents if (d.get("split_strategy") or "page") == "page"]
+        cv_docs = [d for d in page_docs if d.get("doc_type") == "cv_resume"]
+        if page_docs and cv_docs:
+            cv_ratio = len(cv_docs) / max(1, len(page_docs))
+            cv_pages = set(int(p) for d in cv_docs for p in (d.get("pages") or []))
+
+            # Strong signal if 2+ pages are CV, or CV is a big share.
+            if len(cv_docs) >= 2 or cv_ratio >= 0.4:
+                for d in page_docs:
+                    dtype = d.get("doc_type") or "other_documents"
+                    if dtype not in {"educational_documents", "experience_certificates", "certificates"}:
+                        continue
+                    conf = float(d.get("confidence") or 0.0)
+                    # If the model is extremely confident it's a standalone doc, keep it.
+                    if conf >= 0.92:
+                        continue
+                    pages_list = d.get("pages") or []
+                    if not pages_list:
+                        continue
+                    p0 = int(pages_list[0])
+                    if any(abs(p0 - cp) <= 1 for cp in cv_pages):
+                        d["doc_type"] = "cv_resume"
+                        d["needs_review"] = True
+    except Exception as e:
+        logger.warning(f"[Split] CV page promotion heuristic failed: {e}")
 
     # Phase 2: group consecutive full-page units (same doc_type) -> one PDF per group, split_strategy "grouped"
     documents = group_consecutive_pages(documents, pdf_bytes, is_pdf)
