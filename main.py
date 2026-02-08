@@ -2171,8 +2171,29 @@ def upload_photo_to_supabase(image_bytes: bytes, attachment_id: str, file_ext: s
         logger.info(f"[PhotoUpload] Uploading to: {bucket_name}/{file_path}")
         logger.info(f"[PhotoUpload] Image size: {len(image_bytes):,} bytes")
         
-        # Upload using Supabase client
-        response = supabase.storage.from_(bucket_name).upload(file_path, image_bytes)
+        # Upload using Supabase client.
+        # In production this may run multiple times for the same attachment_id;
+        # avoid failing with a 409 Duplicate.
+        content_type = "image/jpeg" if file_ext.lower() in ("jpg", "jpeg") else f"image/{file_ext.lower()}"
+        file_options = {
+            "content-type": content_type,
+            # storage3 supports upsert; when enabled we overwrite existing objects.
+            # If the backend ignores it, we still handle 409 Duplicate below.
+            "upsert": "true",
+        }
+
+        response = None
+        try:
+            response = supabase.storage.from_(bucket_name).upload(file_path, image_bytes, file_options=file_options)
+        except Exception as upload_err:
+            # If object already exists, treat as success and return the existing public URL.
+            # storage3 raises StorageApiError with payload: {'statusCode': 409, 'error': 'Duplicate', ...}
+            err_text = str(upload_err)
+            if "statusCode" in err_text and "409" in err_text and "Duplicate" in err_text:
+                public_url = f"{SUPABASE_URL_CLEAN}/storage/v1/object/public/{bucket_name}/{file_path}"
+                logger.warning(f"[PhotoUpload] Duplicate object; reusing existing URL: {public_url}")
+                return public_url
+            raise
         
         logger.info(f"[PhotoUpload] Upload response: {response}")
         
