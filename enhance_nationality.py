@@ -239,7 +239,7 @@ def enhance_nationality_with_ai(cv_data: Dict[str, Any]) -> Dict[str, Any]:
     
     try:
         response = client.chat.completions.create(
-            model="gpt-4",
+            model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",

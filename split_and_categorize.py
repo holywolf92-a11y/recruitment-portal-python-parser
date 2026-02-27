@@ -14,6 +14,7 @@ import io
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -245,6 +246,35 @@ Return ONLY valid JSON:
 Omit "regions" when layout is "single". When "multi", "category" and "extracted_identity" apply to the primary/first region; we will re-classify each crop.
 """
 
+# ------------------------------------------------------------------
+# Two-pass triage: fast low-detail classify-only prompt (Pass 1)
+# ------------------------------------------------------------------
+VISION_TRIAGE_PROMPT = """Classify this document. Choose ONE category from this exact list:
+cv_resume, passport, cnic, driving_license, educational_documents, experience_certificates,
+navttc_reports, certificates, police_character_certificate, contracts, medical_reports, photos, other_documents
+
+CRITICAL RULES:
+- cv_resume: Has sections like Education / Experience / Skills / Languages / Profile Summary
+- educational_documents: Official standalone academic credential (degree/transcript) with stamps, seals, institution header
+- experience_certificates: Official employer letter with letterhead and stamp/signature
+- cnic: Pakistani National ID Card (shows CNIC number xxxxx-xxxxxxx-x)
+- passport: Passport copy or scan
+
+Return ONLY valid JSON (no extra text):
+{"category": "category_name", "confidence": 0.95}
+"""
+
+# Document types that NEED a high-detail second pass to extract identity fields.
+# All other types return empty identity from the cheap Pass 1.
+IDENTITY_EXTRACT_DOCS = {
+    "passport",
+    "cnic",
+    "driving_license",
+    "cv_resume",                    # need name/email/phone
+    "police_character_certificate", # need name
+    "medical_reports",              # need name
+}
+
 
 def _normalize_identity(raw: dict) -> dict:
     out = {k: raw.get(k) for k in (
@@ -303,7 +333,7 @@ def pdf_to_page_images(pdf_bytes: bytes) -> list[tuple[int, bytes]]:
     result = []
     for i in range(len(doc)):
         page = doc[i]
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
         img = Image.open(io.BytesIO(pix.tobytes("png")))
         buf = io.BytesIO()
         img.save(buf, format="PNG")
@@ -327,31 +357,192 @@ def _parse_vision_json(text: str) -> dict[str, Any]:
     return json.loads(text.strip())
 
 
+# ------------------------------------------------------------------
+# Smart segment-skip helpers — feature extraction + reclassify gate
+# ------------------------------------------------------------------
+
+# Keywords whose sudden appearance strongly signals a document-type boundary
+_IDENTITY_KW = {"passport", "nationality", "mrz", "cnic", "driving", "driver"}
+_CERT_KW     = {"certificate", "degree", "university", "awarded", "transcript", "diploma"}
+_CV_KW       = {"experience", "education", "skills", "objective", "summary", "profile"}
+
+# Regex patterns that FORCE a full reclassification regardless of similarity
+_MRZ_RE   = re.compile(r"[A-Z0-9<]{30,}")
+_CNIC_RE  = re.compile(r"\d{5}-\d{7}-\d")
+
+
+def _extract_page_text_features(pdf_bytes: bytes, page_idx: int) -> dict:
+    """
+    Use PyMuPDF to extract cheap text-level features from a single PDF page.
+    Returns a dict used by _should_reclassify to decide whether to skip Vision.
+    """
+    try:
+        import fitz
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page = doc[page_idx]
+        text = page.get_text() or ""
+        blocks = page.get_text("blocks") or []
+        doc.close()
+
+        text_lower = text.lower()
+        words = set(text_lower.split())
+        return {
+            "text_length": len(text),
+            "block_count": len(blocks),
+            "has_cv_kw":       bool(_CV_KW & words),
+            "has_identity_kw": bool(_IDENTITY_KW & words),
+            "has_cert_kw":     bool(_CERT_KW & words),
+            "has_mrz":         bool(_MRZ_RE.search(text)),
+            "has_cnic":        bool(_CNIC_RE.search(text)),
+        }
+    except Exception:
+        return {}
+
+
+def _should_reclassify(
+    prev: dict, curr: dict, prev_category: str, prev_confidence: float
+) -> bool:
+    """
+    Return True if the current page should be fully reclassified (new Vision call).
+    Return False if it can safely inherit the previous page's classification.
+    Safe-side: when in doubt, reclassify.
+    """
+    if not prev or not curr:
+        return True  # no features to compare → always classify
+
+    # Low previous confidence → always reclassify
+    if prev_confidence < 0.85:
+        return True
+
+    # Forced re-classify: MRZ or CNIC pattern found on current page
+    if curr.get("has_mrz") or curr.get("has_cnic"):
+        return True
+
+    # Text-length ratio: a sudden drop/spike signals a new document
+    prev_len = max(1, prev.get("text_length", 1))
+    curr_len = curr.get("text_length", 0)
+    ratio = curr_len / prev_len
+    if ratio < 0.35 or ratio > 2.8:
+        return True
+
+    # Block-count ratio: CV has many text blocks; passport has very few
+    prev_blk = max(1, prev.get("block_count", 1))
+    curr_blk = curr.get("block_count", 0)
+    blk_ratio = curr_blk / prev_blk
+    if blk_ratio < 0.4 or blk_ratio > 2.5:
+        return True
+
+    # Keyword-domain shift: new keyword class appearing on current page
+    if prev_category == "cv_resume":
+        # CV → identity doc or standalone certificate
+        if curr.get("has_identity_kw") or curr.get("has_cert_kw"):
+            return True
+    elif prev_category in {"passport", "cnic", "driving_license"}:
+        # Identity doc → CV-like page
+        if curr.get("has_cv_kw"):
+            return True
+    elif prev_category in {
+        "educational_documents", "experience_certificates",
+        "navttc_reports", "certificates", "police_character_certificate",
+        "medical_reports", "contracts",
+    }:
+        # Certificate-type → identity doc or CV
+        if curr.get("has_identity_kw") or curr.get("has_cv_kw"):
+            return True
+
+    return False
+
+
 async def classify_page_vision(image_base64: str, openai_api_key: str) -> dict[str, Any]:
-    """Call Vision API for one page; return category, confidence, extracted_identity."""
+    """
+    Two-pass Vision classification.
+
+    Pass 1 — low-detail triage (gpt-4o-mini, detail:low, max_tokens:100)
+        Always runs. Returns category + confidence only. Very cheap.
+
+    Pass 2 — high-detail identity extraction (gpt-4o-mini, detail:high, max_tokens:500)
+        Only runs when the category is in IDENTITY_EXTRACT_DOCS.
+        Extracts all identity fields (name, passport_no, CNIC, etc.).
+
+    For all other categories (certificates, medical, navttc, etc.) Pass 2 is skipped —
+    only the category classification is returned and identity is left empty.
+    """
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(api_key=openai_api_key)
-    messages = [
+
+    # ──────────────────────────────────────────────────────────────
+    # Pass 1: Low-detail, classify only (cheap — 85 fixed tokens)
+    # ──────────────────────────────────────────────────────────────
+    triage_messages = [
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": VISION_PROMPT},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
+                {"type": "text", "text": VISION_TRIAGE_PROMPT},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:image/png;base64,{image_base64}",
+                    "detail": "low",
+                }},
             ],
         }
     ]
-    resp = await client.chat.completions.create(
-        model="gpt-4o",
-        messages=messages,
+    triage_resp = await client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=triage_messages,
         temperature=0.1,
-        max_tokens=2000,
+        max_tokens=100,
     )
-    text = resp.choices[0].message.content.strip()
-    data = _parse_vision_json(text)
-    identity = data.get("extracted_identity") or {}
-    data["extracted_identity"] = _normalize_identity(identity)
-    return data
+    triage_text = triage_resp.choices[0].message.content.strip()
+    try:
+        triage_data = _parse_vision_json(triage_text)
+    except Exception:
+        logger.warning(f"[Split] Triage JSON parse failed: {triage_text[:120]!r} — using other_documents")
+        triage_data = {"category": "other_documents", "confidence": 0.0}
+
+    raw_cat = (triage_data.get("category") or "other_documents").strip()
+    triage_conf = float(triage_data.get("confidence") or 0.0)
+
+    # ──────────────────────────────────────────────────────────────
+    # Pass 2: High-detail identity extraction (only if needed)
+    # ──────────────────────────────────────────────────────────────
+    if raw_cat in IDENTITY_EXTRACT_DOCS:
+        detail_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": VISION_PROMPT},
+                    {"type": "image_url", "image_url": {
+                        "url": f"data:image/png;base64,{image_base64}",
+                        "detail": "high",
+                    }},
+                ],
+            }
+        ]
+        try:
+            detail_resp = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=detail_messages,
+                temperature=0.1,
+                max_tokens=500,
+            )
+            detail_text = detail_resp.choices[0].message.content.strip()
+            data = _parse_vision_json(detail_text)
+            identity = data.get("extracted_identity") or {}
+            data["extracted_identity"] = _normalize_identity(identity)
+            # Prefer the triage category if the high-detail pass returned lower confidence
+            if float(data.get("confidence") or 0.0) < triage_conf * 0.9:
+                data["category"] = raw_cat
+                data["confidence"] = triage_conf
+            return data
+        except Exception as e:
+            logger.warning(f"[Split] High-detail pass failed ({e}), falling back to triage result")
+
+    # Pass 2 skipped or failed — return triage result with empty identity
+    return {
+        "category": raw_cat,
+        "confidence": triage_conf,
+        "extracted_identity": _normalize_identity({}),
+    }
 
 
 async def classify_page_vision_with_layout(image_base64: str, openai_api_key: str) -> dict[str, Any]:
@@ -364,15 +555,15 @@ async def classify_page_vision_with_layout(image_base64: str, openai_api_key: st
             "role": "user",
             "content": [
                 {"type": "text", "text": VISION_LAYOUT_PROMPT},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}", "detail": "high"}},
             ],
         }
     ]
     resp = await client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-4o-mini",
         messages=messages,
         temperature=0.1,
-        max_tokens=2000,
+        max_tokens=500,
     )
     text = resp.choices[0].message.content.strip()
     data = _parse_vision_json(text)
@@ -920,7 +1111,44 @@ async def run_split_and_categorize(
         first_img = pages[0][1]
         engine_used = detect_engine(first_img, region=aws_region)
 
+    # Smart-skip state: track previous page features, category and confidence
+    prev_features: dict = {}
+    prev_category: str | None = None
+    prev_confidence: float = 0.0
+
     for page_idx, img_bytes in pages:
+        # ── Smart segment-skip check ───────────────────────────────────────
+        # Only applies to PDFs (we need text features); never skips page 0;
+        # never skips if prev confidence was low.
+        if is_pdf and page_idx > 0 and prev_category is not None:
+            curr_features = _extract_page_text_features(file_content, page_idx)
+            should_reclassify = _should_reclassify(
+                prev_features, curr_features, prev_category, prev_confidence
+            )
+            if not should_reclassify:
+                # Inherit previous classification — zero Vision API calls for this page
+                logger.info(
+                    f"[Split] Page {page_idx}: text-similar to page {page_idx - 1} "
+                    f"({prev_category}, conf={prev_confidence:.2f}) — inheriting, skipping Vision call"
+                )
+                pdf_one = (
+                    extract_pages_as_pdf_bytes(file_content, [page_idx])
+                    if is_pdf
+                    else image_bytes_to_pdf(img_bytes)
+                )
+                _append_doc(
+                    documents, prev_category, prev_confidence,
+                    {},           # empty identity for inherited pages
+                    pdf_one, page_idx, [], "page",
+                    image_bytes=img_bytes,
+                )
+                prev_features = curr_features
+                continue
+            # Features differ → full classification below
+            prev_features = curr_features
+        elif is_pdf:
+            prev_features = _extract_page_text_features(file_content, page_idx)
+        # ── Full classification ────────────────────────────────────────────
         if engine_used == "textract+vision":
             await _process_page_textract_vision(
                 page_idx, img_bytes, pdf_bytes, is_pdf, aws_region, openai_api_key, documents
@@ -929,6 +1157,12 @@ async def run_split_and_categorize(
             await _process_page_vision_only(
                 page_idx, img_bytes, pdf_bytes, is_pdf, openai_api_key, documents
             )
+
+        # Update skip-state from the document just appended
+        if documents:
+            last_doc = documents[-1]
+            prev_category = last_doc.get("doc_type") or prev_category
+            prev_confidence = float(last_doc.get("confidence") or 0.0)
 
     # Heuristic: if the upload is mostly a passport, treat nearby low-confidence other_documents pages
     # as passport too (common when users scan blank passport pages).
