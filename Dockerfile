@@ -7,20 +7,10 @@ ENV PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive
 
 # Install system dependencies
-# cmake, build-essential: required to compile dlib
-# libx11-dev, etc: X11 headers required for dlib GUI support checks
-# libopenblas-dev: Linear algebra libraries for dlib optimization
+# libgl1-mesa-glx: needed by opencv-python-headless on Debian
 RUN apt-get update && apt-get install -y \
-    cmake \
-    build-essential \
-    pkg-config \
-    libx11-dev \
-    libxext-dev \
-    libsm-dev \
-    libxrender-dev \
     libgl1-mesa-glx \
-    libopenblas-dev \
-    liblapack-dev \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory

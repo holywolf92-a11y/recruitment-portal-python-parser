@@ -1887,7 +1887,7 @@ def extract_profile_photo_from_image(image_content: bytes, attachment_id: str) -
     Returns the signed URL of the uploaded photo, or None if no photo found.
     """
     try:
-        import face_recognition
+        import cv2
         
         logger.info(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} action=START")
         
@@ -1901,9 +1901,13 @@ def extract_profile_photo_from_image(image_content: bytes, attachment_id: str) -
         w, h = pil_img.size
         logger.info(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} image_loaded dims={w}x{h}")
         
-        # Step 2: Detect faces with real ML (face-recognition library)
+        # Step 2: Detect faces with OpenCV Haar Cascade (no compilation required)
         img_array = np.array(pil_img)
-        face_locations = face_recognition.face_locations(img_array, model="hog")
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        raw_faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
+        # Convert (x, y, w, h) → (top, right, bottom, left)
+        face_locations = [(y, x + fw, y + fh, x) for (x, y, fw, fh) in (raw_faces if len(raw_faces) > 0 else [])]
         
         if not face_locations:
             logger.info(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} action=SKIP reason=NO_FACES_DETECTED")
@@ -1986,7 +1990,7 @@ def extract_profile_photo_from_image(image_content: bytes, attachment_id: str) -
         return photo_url
         
     except ImportError as e:
-        logger.warning(f"[PHOTO_EXTRACT_IMG] face-recognition library not available: {e}")
+        logger.warning(f"[PHOTO_EXTRACT_IMG] opencv-python-headless library not available: {e}")
         return None
         
     except Exception as e:
@@ -2009,7 +2013,7 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str, max_p
     Returns the signed URL of the uploaded photo, or None if no photo found.
     """
     try:
-        import face_recognition
+        import cv2
         
         logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=START")
         
@@ -2019,6 +2023,7 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str, max_p
             logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=NO_PAGES")
             return None
 
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         best_face_crop = None
         best_face_area = 0
 
@@ -2032,9 +2037,12 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str, max_p
             w, h = pil_img.size
             logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} page_rendered page={page_index+1} dims={w}x{h}")
 
-            # Step 2: Detect faces with real ML (face-recognition library)
+            # Step 2: Detect faces with OpenCV Haar Cascade (no compilation required)
             img_array = np.array(pil_img)
-            face_locations = face_recognition.face_locations(img_array, model="hog")
+            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+            raw_faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
+            # Convert (x, y, w, h) → (top, right, bottom, left)
+            face_locations = [(y, x + fw, y + fh, x) for (x, y, fw, fh) in (raw_faces if len(raw_faces) > 0 else [])]
 
             if not face_locations:
                 continue
@@ -2118,8 +2126,7 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str, max_p
         return photo_url
         
     except ImportError as e:
-        logger.warning(f"[PHOTO_EXTRACT] face-recognition library not available: {e}")
-        logger.warning(f"[PHOTO_EXTRACT] Install with: pip install face-recognition dlib")
+        logger.warning(f"[PHOTO_EXTRACT] opencv-python-headless library not available: {e}")
         return None
         
     except Exception as e:
