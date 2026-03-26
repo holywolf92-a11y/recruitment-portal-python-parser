@@ -1,11 +1,11 @@
 # Python CV Parser Service
 
-FastAPI-based CV parsing service using OpenAI GPT-4 for structured data extraction.
+FastAPI-based CV parsing service using OpenAI models for structured data extraction.
 
 ## Features
 
 - ✅ HMAC authentication for secure requests
-- ✅ OpenAI GPT-4 integration
+- ✅ OpenAI text and vision integration
 - ✅ Structured JSON output
 - ✅ Health check endpoint
 - ✅ File upload support
@@ -17,7 +17,11 @@ PYTHON_HMAC_SECRET=your-secret-key  # Must match backend
 OPENAI_API_KEY=sk-proj-xxxxx
 PORT=8000
 ENVIRONMENT=production
+CV_VISION_MODEL=gpt-4o-mini
+DOCUMENT_VISION_MODEL=gpt-4o-mini
 ```
+
+Production currently pins both vision paths to `gpt-4o-mini` explicitly in Railway.
 
 ## API Endpoints
 
@@ -65,6 +69,7 @@ uvicorn main:app --reload --port 8000
 
 1. Create new service from GitHub repo
 2. Set environment variables in Railway dashboard
-3. Deploy automatically
+3. For production clarity, pin `CV_VISION_MODEL` and `DOCUMENT_VISION_MODEL` explicitly even though the service defaults to `gpt-4o-mini`
+4. Deploy automatically
 
 Railway will detect Python and use the Procfile.
