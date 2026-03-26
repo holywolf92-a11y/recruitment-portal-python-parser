@@ -68,6 +68,10 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 # Vision parsing page limits (kept conservative; can be tuned per env)
 CV_VISION_MAX_PAGES = int(os.getenv("CV_VISION_MAX_PAGES", "2"))
 CV_VISION_MAX_PAGES_FALLBACK = int(os.getenv("CV_VISION_MAX_PAGES_FALLBACK", "4"))
+CV_VISION_MODEL = os.getenv("CV_VISION_MODEL", "gpt-4o-mini")
+DOCUMENT_VISION_MAX_PAGES = int(os.getenv("DOCUMENT_VISION_MAX_PAGES", "2"))
+DOCUMENT_TEXT_MIN_CHARS = int(os.getenv("DOCUMENT_TEXT_MIN_CHARS", "150"))
+DOCUMENT_VISION_MODEL = os.getenv("DOCUMENT_VISION_MODEL", "gpt-4o-mini")
 
 # Normalize SUPABASE_URL for storage3 client which expects a trailing slash
 # Keep a clean version without trailing slash for public URL generation
@@ -892,8 +896,9 @@ async def parse_cv_with_vision(file_content: bytes, filename: str, max_pages: in
 
         async def run_vision_parse(images_payload):
             prompt = build_cv_prompt("", from_images=True)
+            logger.info(f"[CVVision] Calling OpenAI Vision API ({CV_VISION_MODEL}) with {len(images_payload)} image(s)")
             response = openai.chat.completions.create(
-                model="gpt-4o",
+                model=CV_VISION_MODEL,
                 messages=[
                     {"role": "system", "content": "You are a precise CV parser that returns only valid JSON."},
                     {"role": "user", "content": [{"type": "text", "text": prompt}, *images_payload]},
@@ -993,8 +998,9 @@ async def parse_cv_with_vision_image(file_content: bytes, filename: str, image_f
         prompt = build_cv_prompt("", from_images=True)
         
         # Call OpenAI Vision API
+        logger.info(f"[CVVisionImage] Calling OpenAI Vision API ({CV_VISION_MODEL})")
         response = openai.chat.completions.create(
-            model="gpt-4o",
+            model=CV_VISION_MODEL,
             messages=[
                 {"role": "system", "content": "You are a precise CV parser that returns only valid JSON."},
                 {"role": "user", "content": [{"type": "text", "text": prompt}, *images]},
@@ -1437,8 +1443,10 @@ async def categorize_document_with_vision_api(file_content: bytes, file_name: st
             import io
             
             pdf_doc = fitz.open(stream=file_content, filetype="pdf")
+            total_pages = len(pdf_doc)
+            pages_to_process = min(total_pages, DOCUMENT_VISION_MAX_PAGES)
             
-            for page_num in range(len(pdf_doc)):
+            for page_num in range(pages_to_process):
                 page = pdf_doc[page_num]
                 # Render page to image (2x zoom = ~144 DPI for good quality)
                 pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
@@ -1456,14 +1464,16 @@ async def categorize_document_with_vision_api(file_content: bytes, file_name: st
                     }
                 })
                 
-                logger.info(f"[VisionAPI] Converted PDF page {page_num + 1} to image ({len(img_base64)} chars base64)")
+                logger.info(f"[VisionAPI] Converted PDF page {page_num + 1}/{pages_to_process} to image ({len(img_base64)} chars base64)")
             
             pdf_doc.close()
             
             if not images:
                 raise Exception("No pages found in PDF")
             
-            logger.info(f"[VisionAPI] Converted {len(images)} PDF page(s) to images")
+            logger.info(
+                f"[VisionAPI] Converted {len(images)} of {total_pages} PDF page(s) to images (cap={DOCUMENT_VISION_MAX_PAGES})"
+            )
         else:
             # Image: Send directly (just encode as base64 - no conversion needed!)
             img_base64 = base64.b64encode(file_content).decode('utf-8')
@@ -1565,10 +1575,10 @@ Extract this information even if labels are slightly different."""
             }
         ]
         
-        logger.info(f"[VisionAPI] Calling OpenAI Vision API (GPT-4o) with {len(images)} image(s)")
+        logger.info(f"[VisionAPI] Calling OpenAI Vision API ({DOCUMENT_VISION_MODEL}) with {len(images)} image(s)")
         
         response = client.chat.completions.create(
-            model="gpt-4o",  # Use GPT-4o for vision (better than gpt-4o-mini for images)
+            model=DOCUMENT_VISION_MODEL,
             messages=messages,
             temperature=0.1,
             max_tokens=2000
@@ -2462,9 +2472,22 @@ async def categorize_document(
         # 3. For text files: Extract text and send to text-based API
         
         if mime_type == "application/pdf":
-            # PDF: Convert pages to images, then send to Vision API
-            logger.info(f"[CategorizeDocument] PDF detected - converting to images for Vision API: {file_name}")
-            result = await categorize_document_with_vision_api(file_bytes, file_name, is_pdf=True)
+            file_text = ""
+            try:
+                file_text = extract_text_from_pdf(file_bytes)
+            except Exception as text_error:
+                logger.warning(f"[CategorizeDocument] PDF text extraction failed for {file_name}: {text_error}")
+
+            if len(file_text.strip()) >= DOCUMENT_TEXT_MIN_CHARS:
+                logger.info(
+                    f"[CategorizeDocument] PDF text extracted ({len(file_text)} chars). Using text categorization for {file_name}"
+                )
+                result = await categorize_document_with_ai_text(file_text, file_name, mime_type)
+            else:
+                logger.info(
+                    f"[CategorizeDocument] PDF text weak ({len(file_text)} chars). Falling back to capped vision for {file_name}"
+                )
+                result = await categorize_document_with_vision_api(file_bytes, file_name, is_pdf=True)
         elif mime_type in ["image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"]:
             # Image: Send directly to Vision API (just encode as base64)
             logger.info(f"[CategorizeDocument] Image detected - sending directly to Vision API: {file_name}")
