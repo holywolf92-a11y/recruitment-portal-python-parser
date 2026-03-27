@@ -2101,7 +2101,58 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str, max_p
         pdf_document.close()
 
         if best_face_crop is None:
-            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=NO_FACES_DETECTED")
+            # Fallback: Haar Cascade missed the face (turned head, partial occlusion, etc.)
+            # Try extracting discrete embedded image objects from the PDF via PyMuPDF.
+            # Most CV templates embed the headshot as a real image object — this is
+            # format-independent and doesn't require face detection.
+            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=FALLBACK reason=NO_FACES_DETECTED trying embedded images")
+            try:
+                doc2 = fitz.open(stream=pdf_content, filetype="pdf")
+                candidate_images = []
+                pages_to_check = min(max_pages, doc2.page_count)
+                for page_idx in range(pages_to_check):
+                    page = doc2[page_idx]
+                    for img_info in page.get_images(full=True):
+                        xref = img_info[0]
+                        try:
+                            base_image = doc2.extract_image(xref)
+                            img_bytes = base_image["image"]
+                            img_w = base_image.get("width", 0)
+                            img_h = base_image.get("height", 0)
+                            # Skip icons/logos (too small) and full-page backgrounds (too large)
+                            if img_w < 80 or img_h < 80:
+                                continue
+                            if img_w > 2000 or img_h > 2000:
+                                continue
+                            # Only accept portrait or square aspect ratios (typical headshots)
+                            aspect = img_h / img_w if img_w > 0 else 0
+                            if aspect < 0.5 or aspect > 2.5:
+                                continue
+                            candidate_images.append((img_w * img_h, img_bytes))
+                            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} embedded_image page={page_idx+1} size={img_w}x{img_h} aspect={aspect:.2f}")
+                        except Exception:
+                            continue
+                doc2.close()
+
+                if candidate_images:
+                    # Pick the largest qualifying image — most likely the profile photo
+                    candidate_images.sort(key=lambda x: x[0], reverse=True)
+                    _, best_img_bytes = candidate_images[0]
+                    pil_img = Image.open(io.BytesIO(best_img_bytes))
+                    if pil_img.mode != 'RGB':
+                        pil_img = pil_img.convert('RGB')
+                    pil_img = pil_img.resize((512, 512), Image.Resampling.LANCZOS)
+                    buf = io.BytesIO()
+                    pil_img.save(buf, format='JPEG', quality=95)
+                    photo_bytes = buf.getvalue()
+                    photo_url = upload_photo_to_supabase(photo_bytes, attachment_id, "jpg")
+                    if photo_url:
+                        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} SUCCESS_FALLBACK uploaded_as={photo_url}")
+                        return photo_url
+            except Exception as fallback_err:
+                logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} fallback_error={fallback_err}")
+
+            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=NO_PHOTO_FOUND")
             return None
 
         # Step 4: Standardize to square 512x512
