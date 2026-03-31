@@ -857,14 +857,16 @@ async def parse_cv_with_vision(file_content: bytes, filename: str, max_pages: in
 
             for page_index in range(pages_to_render_local):
                 page = pdf_doc_local[page_index]
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                img_bytes = pix.tobytes("png")
-                img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+                img_pil = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+                jpeg_buf = io.BytesIO()
+                img_pil.save(jpeg_buf, format="JPEG", quality=85, optimize=True)
+                img_base64 = base64.b64encode(jpeg_buf.getvalue()).decode('utf-8')
                 images_local.append({
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{img_base64}"}
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}
                 })
-                logger.info(f"[CVVision] Rendered page {page_index + 1}/{pages_to_render_local} for vision parsing")
+                logger.info(f"[CVVision] Rendered page {page_index + 1}/{pages_to_render_local} for vision parsing ({len(jpeg_buf.getvalue())//1024}KB JPEG)")
 
             pdf_doc_local.close()
             return images_local, total_pages_local, pages_to_render_local
@@ -1448,19 +1450,18 @@ async def categorize_document_with_vision_api(file_content: bytes, file_name: st
             
             for page_num in range(pages_to_process):
                 page = pdf_doc[page_num]
-                # Render page to image (2x zoom = ~144 DPI for good quality)
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                img_data = pix.tobytes("png")
-                img = Image.open(io.BytesIO(img_data))
+                # Render page to image (1.5x zoom = ~108 DPI — sufficient for GPT-4o-mini vision)
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+                img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
                 
-                # Convert to base64 for OpenAI Vision API
+                # Convert to JPEG for smaller payload (saves egress vs PNG)
                 buffered = io.BytesIO()
-                img.save(buffered, format="PNG")
+                img.save(buffered, format="JPEG", quality=85, optimize=True)
                 img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
                 images.append({
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:image/png;base64,{img_base64}"
+                        "url": f"data:image/jpeg;base64,{img_base64}"
                     }
                 })
                 

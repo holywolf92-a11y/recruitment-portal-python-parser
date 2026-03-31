@@ -325,7 +325,7 @@ def _normalize_identity(raw: dict) -> dict:
 
 
 def pdf_to_page_images(pdf_bytes: bytes) -> list[tuple[int, bytes]]:
-    """Convert PDF to list of (page_idx, png_bytes)."""
+    """Convert PDF to list of (page_idx, jpeg_bytes)."""
     import fitz
     from PIL import Image
 
@@ -334,9 +334,9 @@ def pdf_to_page_images(pdf_bytes: bytes) -> list[tuple[int, bytes]]:
     for i in range(len(doc)):
         page = doc[i]
         pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
         buf = io.BytesIO()
-        img.save(buf, format="PNG")
+        img.save(buf, format="JPEG", quality=85, optimize=True)
         result.append((i, buf.getvalue()))
     doc.close()
     return result
@@ -480,7 +480,7 @@ async def classify_page_vision(image_base64: str, openai_api_key: str) -> dict[s
             "content": [
                 {"type": "text", "text": VISION_TRIAGE_PROMPT},
                 {"type": "image_url", "image_url": {
-                    "url": f"data:image/png;base64,{image_base64}",
+                    "url": f"data:image/jpeg;base64,{image_base64}",
                     "detail": "low",
                 }},
             ],
@@ -512,7 +512,7 @@ async def classify_page_vision(image_base64: str, openai_api_key: str) -> dict[s
                 "content": [
                     {"type": "text", "text": VISION_PROMPT},
                     {"type": "image_url", "image_url": {
-                        "url": f"data:image/png;base64,{image_base64}",
+                        "url": f"data:image/jpeg;base64,{image_base64}",
                         "detail": "high",
                     }},
                 ],
@@ -555,7 +555,7 @@ async def classify_page_vision_with_layout(image_base64: str, openai_api_key: st
             "role": "user",
             "content": [
                 {"type": "text", "text": VISION_LAYOUT_PROMPT},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}", "detail": "high"}},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}", "detail": "high"}},
             ],
         }
     ]
