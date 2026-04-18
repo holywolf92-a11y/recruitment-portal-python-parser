@@ -25,6 +25,7 @@ if not _load:
     if _fallback.exists():
         load_dotenv(_fallback)
 from typing import Optional, Dict, Any
+from collections import OrderedDict
 import openai
 from datetime import datetime
 
@@ -49,6 +50,28 @@ CV2_FALLBACK_AVAILABLE = False
 
 app = FastAPI(title="CV Parser Service", version="2.2.0-multi-format-support")
 
+# In-memory LRU cache for document categorization (keyed on SHA-256 of file bytes)
+# Prevents redundant OpenAI calls when the same passport/CNIC is re-submitted.
+_DOC_CACHE_MAX_SIZE = 500
+_doc_categorization_cache: OrderedDict = OrderedDict()
+
+def _doc_cache_key(file_bytes: bytes) -> str:
+    return hashlib.sha256(file_bytes).hexdigest()
+
+def _doc_cache_get(key: str):
+    if key in _doc_categorization_cache:
+        _doc_categorization_cache.move_to_end(key)
+        return _doc_categorization_cache[key]
+    return None
+
+def _doc_cache_set(key: str, value: dict):
+    if key in _doc_categorization_cache:
+        _doc_categorization_cache.move_to_end(key)
+    else:
+        if len(_doc_categorization_cache) >= _DOC_CACHE_MAX_SIZE:
+            _doc_categorization_cache.popitem(last=False)
+    _doc_categorization_cache[key] = value
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -69,6 +92,8 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 CV_VISION_MAX_PAGES = int(os.getenv("CV_VISION_MAX_PAGES", "2"))
 CV_VISION_MAX_PAGES_FALLBACK = int(os.getenv("CV_VISION_MAX_PAGES_FALLBACK", "4"))
 CV_VISION_MODEL = os.getenv("CV_VISION_MODEL", "gpt-4o-mini")
+# Disable the second-pass vision retry (saves ~50% of CV parsing cost)
+DISABLE_CV_VISION_RETRY = os.getenv("DISABLE_CV_VISION_RETRY", "false").lower() == "true"
 DOCUMENT_VISION_MAX_PAGES = int(os.getenv("DOCUMENT_VISION_MAX_PAGES", "2"))
 DOCUMENT_TEXT_MIN_CHARS = int(os.getenv("DOCUMENT_TEXT_MIN_CHARS", "150"))
 DOCUMENT_VISION_MODEL = os.getenv("DOCUMENT_VISION_MODEL", "gpt-4o-mini")
@@ -919,7 +944,8 @@ async def parse_cv_with_vision(file_content: bytes, filename: str, max_pages: in
         parsed_data = await run_vision_parse(images)
 
         # If experience extraction is empty and the PDF has more pages, do a second pass with more pages.
-        if needs_more_pages(parsed_data) and total_pages > rendered_pages and CV_VISION_MAX_PAGES_FALLBACK > rendered_pages:
+        # Disabled via DISABLE_CV_VISION_RETRY=true to reduce OpenAI cost.
+        if not DISABLE_CV_VISION_RETRY and needs_more_pages(parsed_data) and total_pages > rendered_pages and CV_VISION_MAX_PAGES_FALLBACK > rendered_pages:
             second_pages = min(CV_VISION_MAX_PAGES_FALLBACK, total_pages)
             logger.info(f"[CVVision] Experience appears missing; retrying with {second_pages} pages (pdf has {total_pages})")
             images2, _, rendered2 = render_pdf_pages(second_pages)
@@ -1082,7 +1108,14 @@ async def categorize_document(
     try:
         # Decode base64 file content
         file_bytes = base64.b64decode(categorize_request.file_content)
-        
+
+        # Check in-memory cache first (avoids re-calling OpenAI for the same document bytes)
+        _ck = _doc_cache_key(file_bytes)
+        _cached = _doc_cache_get(_ck)
+        if _cached:
+            logger.info(f"[DocumentCategorization] Cache hit for {categorize_request.file_name} (sha256={_ck[:16]}...) - skipping OpenAI call")
+            return _cached
+
         # Use OpenAI Vision API to read documents directly (much more reliable than text extraction)
         # Vision API accepts: PNG, JPEG, GIF, WebP (NOT PDFs directly)
         # So we need to:
@@ -1152,12 +1185,14 @@ async def categorize_document(
             }
         
         # Always return required fields, even if missing
-        return {
+        _response = {
             "success": True,
             "category": result.get("category", "other_documents"),
             "confidence": float(result.get("confidence", 0.0)),
             "identity_fields": result.get("identity_fields")
         }
+        _doc_cache_set(_ck, _response)
+        return _response
 
     except HTTPException:
         raise
@@ -2515,7 +2550,14 @@ async def categorize_document(
         except Exception as decode_error:
             logger.error(f"[CategorizeDocument] Base64 decode error: {decode_error}")
             raise HTTPException(status_code=400, detail=f"Invalid base64-encoded file content: {str(decode_error)}")
-        
+
+        # Check in-memory cache first (avoids re-calling OpenAI for the same document bytes)
+        _ck2 = _doc_cache_key(file_bytes)
+        _cached2 = _doc_cache_get(_ck2)
+        if _cached2:
+            logger.info(f"[CategorizeDocument] Cache hit for {file_name} (sha256={_ck2[:16]}...) - skipping OpenAI call")
+            return _cached2
+
         # Use OpenAI Vision API to read documents directly (much more reliable than text extraction)
         # Vision API accepts: PNG, JPEG, GIF, WebP (NOT PDFs directly)
         # So we need to:
@@ -2554,7 +2596,7 @@ async def categorize_document(
             logger.info(f"[CategorizeDocument] Text file - extracted {len(file_text)} characters from {file_name}")
             result = await categorize_document_with_ai_text(file_text, file_name, mime_type)
         # Ensure all required fields are present, even if null
-        return {
+        _response2 = {
             "success": True,
             "category": result.get("category", None),
             "confidence": result.get("confidence", None),
@@ -2563,6 +2605,8 @@ async def categorize_document(
             "mismatch_fields": result.get("mismatch_fields", []),
             "raw_text": None  # Don't return raw text to reduce payload size
         }
+        _doc_cache_set(_ck2, _response2)
+        return _response2
     except Exception as e:
         logger.error(f"[CategorizeDocument] Error: {e}")
         # Always return all required fields as null/empty on error
