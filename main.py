@@ -1486,11 +1486,11 @@ async def parse_cv_from_url(
                     parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
                     used_vision = True
                 except Exception as e:
-                logger.error(f"[CVParse] Failed to parse unknown file type: {e}")
-                raise HTTPException(
-                    status_code=400,
-                    detail="Unsupported file format. Please upload a PDF or image file (JPEG, PNG, GIF, WebP, BMP)."
-                )
+                    logger.error(f"[CVParse] Failed to parse unknown file type: {e}")
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Unsupported file format. Please upload a PDF or image file (JPEG, PNG, GIF, WebP, BMP)."
+                    )
         
         # Ensure we have parsed data
         if not parsed_data:
