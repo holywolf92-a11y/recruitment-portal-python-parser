@@ -96,6 +96,9 @@ CV_VISION_MODEL = os.getenv("CV_VISION_MODEL", "gpt-4o-mini")
 DISABLE_CV_VISION_RETRY = os.getenv("DISABLE_CV_VISION_RETRY", "false").lower() == "true"
 # Disable ALL vision-based CV parsing (zero OpenAI vision cost; text-only parsing only)
 DISABLE_CV_VISION = os.getenv("DISABLE_CV_VISION", "false").lower() == "true"
+# Google Cloud Vision API key — used as cheap OCR fallback for scanned PDFs when DISABLE_CV_VISION=true
+# Cost: $1.50/1000 pages vs OpenAI Vision $15/1000 pages (10x cheaper)
+GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "")
 DOCUMENT_VISION_MAX_PAGES = int(os.getenv("DOCUMENT_VISION_MAX_PAGES", "2"))
 DOCUMENT_TEXT_MIN_CHARS = int(os.getenv("DOCUMENT_TEXT_MIN_CHARS", "150"))
 DOCUMENT_VISION_MODEL = os.getenv("DOCUMENT_VISION_MODEL", "gpt-4o-mini")
@@ -1374,14 +1377,23 @@ async def parse_cv_from_url(
                 profile_photo_url = extract_profile_photo_from_pdf(file_content, attachment_id or "unknown")
                 
                 # Parse with OpenAI (fallback to Vision when text extraction is weak)
-                if not DISABLE_CV_VISION and len(text_content.strip()) < 200:
-                    logger.warning(f"[CVParse] Low text extracted ({len(text_content)} chars). Using Vision parsing.")
-                    parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
-                    used_vision = True
+                if len(text_content.strip()) < 200:
+                    logger.warning(f"[CVParse] Low text extracted ({len(text_content)} chars). Trying Google Vision OCR...")
+                    google_text = await extract_text_from_scanned_pdf_google_vision(file_content)
+                    if google_text and len(google_text.strip()) > 100:
+                        logger.info(f"[CVParse] Google Vision OCR extracted {len(google_text)} chars. Parsing with text model.")
+                        parsed_data = await parse_cv_with_openai(google_text, attachment_id or "unknown")
+                    elif not DISABLE_CV_VISION:
+                        logger.warning("[CVParse] Google Vision OCR insufficient. Using OpenAI Vision as fallback.")
+                        parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
+                        used_vision = True
+                    else:
+                        logger.warning("[CVParse] Google Vision OCR insufficient and DISABLE_CV_VISION=true. Parsing with available text.")
+                        parsed_data = await parse_cv_with_openai(text_content, attachment_id or "unknown")
                 else:
                     parsed_data = await parse_cv_with_openai(text_content, attachment_id or "unknown")
                 
-                # Check for placeholder data
+                # Check for placeholder data (only retry with OpenAI Vision if not disabled)
                 if not used_vision and not DISABLE_CV_VISION and looks_placeholder_cv(parsed_data):
                     logger.warning("[CVParse] Placeholder data detected. Retrying with Vision parsing.")
                     parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
@@ -1389,62 +1401,87 @@ async def parse_cv_from_url(
                     
             except Exception as pdf_error:
                 logger.error(f"[CVParse] PDF extraction failed: {pdf_error}")
-                if DISABLE_CV_VISION:
-                    logger.warning("[CVParse] PDF extraction failed and DISABLE_CV_VISION=true, skipping Vision fallback.")
+                # Try Google Vision OCR as recovery path
+                google_text = await extract_text_from_scanned_pdf_google_vision(file_content)
+                if google_text and len(google_text.strip()) > 50:
+                    logger.info(f"[CVParse] Google Vision OCR recovered {len(google_text)} chars after PDF failure.")
+                    try:
+                        parsed_data = await parse_cv_with_openai(google_text, attachment_id or "unknown")
+                    except Exception as ocr_parse_error:
+                        logger.error(f"[CVParse] OpenAI text parse after Google OCR failed: {ocr_parse_error}")
+                        raise HTTPException(status_code=500, detail=f"Failed to parse OCR text: {str(ocr_parse_error)}")
+                elif not DISABLE_CV_VISION:
+                    logger.warning("[CVParse] PDF extraction failed and Google Vision OCR insufficient. Trying OpenAI Vision fallback...")
+                    try:
+                        parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
+                        used_vision = True
+                    except Exception as vision_error:
+                        logger.error(f"[CVParse] OpenAI Vision fallback also failed: {vision_error}")
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"Failed to parse PDF with text extraction, Google Vision OCR, and OpenAI Vision: {str(pdf_error)}"
+                        )
+                else:
                     raise HTTPException(
                         status_code=500,
-                        detail=f"Failed to parse PDF (Vision API disabled): {str(pdf_error)}"
+                        detail=f"Failed to parse PDF. Google Vision API key not configured: {str(pdf_error)}"
                     )
-                logger.warning("[CVParse] PDF extraction failed. Trying Vision API fallback...")
-                # Fallback to Vision API for corrupted/scanned PDFs
+        
+        # Strategy 2: If it's an image, use Google Vision OCR or OpenAI Vision
+        elif file_type in ['jpeg', 'png', 'gif', 'webp', 'bmp']:
+            logger.info(f"[CVParse] Image file detected ({file_type}).")
+            profile_photo_url = extract_profile_photo_from_image(file_content, attachment_id or "unknown")
+            
+            if DISABLE_CV_VISION or GOOGLE_VISION_API_KEY:
+                # Prefer Google Vision OCR (cheaper)
+                google_text = await _google_vision_ocr_image_bytes(file_content)
+                if google_text and len(google_text.strip()) > 50:
+                    logger.info(f"[CVParse] Google Vision OCR extracted {len(google_text)} chars from image CV.")
+                    parsed_data = await parse_cv_with_openai(google_text, attachment_id or "unknown")
+                elif DISABLE_CV_VISION:
+                    logger.warning("[CVParse] Google Vision OCR insufficient and DISABLE_CV_VISION=true.")
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Image-format CVs require Google Cloud Vision API key (GOOGLE_VISION_API_KEY). Please re-upload as PDF or set up Google Vision."
+                    )
+                else:
+                    # Google Vision failed but OpenAI Vision is allowed
+                    logger.warning("[CVParse] Google Vision OCR insufficient. Falling back to OpenAI Vision.")
+                    parsed_data = await parse_cv_with_vision_image(file_content, attachment_id or "unknown", file_type)
+                    used_vision = True
+            else:
+                # No Google Vision key — use OpenAI Vision directly
                 try:
-                    parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
+                    logger.info("[CVParse] No Google Vision key — using OpenAI Vision for image CV.")
+                    parsed_data = await parse_cv_with_vision_image(file_content, attachment_id or "unknown", file_type)
                     used_vision = True
                 except Exception as vision_error:
-                    logger.error(f"[CVParse] Vision API fallback also failed: {vision_error}")
+                    logger.error(f"[CVParse] Vision API processing failed for image: {vision_error}")
                     raise HTTPException(
                         status_code=500,
-                        detail=f"Failed to parse PDF with both text extraction and Vision API: {str(pdf_error)}"
+                        detail=f"Failed to parse image CV with Vision API: {str(vision_error)}"
                     )
         
-        # Strategy 2: If it's an image, go directly to Vision API
-        elif file_type in ['jpeg', 'png', 'gif', 'webp', 'bmp']:
-            logger.info(f"[CVParse] Image file detected ({file_type}). Using Vision API directly.")
-            if DISABLE_CV_VISION:
-                logger.warning("[CVParse] DISABLE_CV_VISION=true, cannot parse image-format CVs without Vision API.")
-                raise HTTPException(
-                    status_code=422,
-                    detail="Image-format CVs require Vision API which is currently disabled. Please re-upload as PDF."
-                )
-            try:
-                # Parse CV content with Vision API
-                parsed_data = await parse_cv_with_vision_image(file_content, attachment_id or "unknown", file_type)
-                used_vision = True
-                
-                # Extract profile photo from the image (face detection)
-                profile_photo_url = extract_profile_photo_from_image(file_content, attachment_id or "unknown")
-                
-            except Exception as vision_error:
-                logger.error(f"[CVParse] Vision API processing failed for image: {vision_error}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to parse image CV with Vision API: {str(vision_error)}"
-                )
-        
-        # Strategy 3: Unknown file type - try Vision API as last resort
+        # Strategy 3: Unknown file type - try Google Vision OCR then OpenAI Vision as last resort
         else:
-            logger.warning(f"[CVParse] Unknown file type. Attempting Vision API as last resort...")
-            if DISABLE_CV_VISION:
-                logger.warning("[CVParse] DISABLE_CV_VISION=true, skipping Vision fallback for unknown file type.")
+            logger.warning(f"[CVParse] Unknown file type. Attempting Google Vision OCR as last resort...")
+            google_text = await extract_text_from_scanned_pdf_google_vision(file_content)
+            if not google_text or len(google_text.strip()) < 50:
+                google_text = await _google_vision_ocr_image_bytes(file_content)
+            if google_text and len(google_text.strip()) > 50:
+                logger.info(f"[CVParse] Google Vision OCR recovered {len(google_text)} chars from unknown file type.")
+                parsed_data = await parse_cv_with_openai(google_text, attachment_id or "unknown")
+            elif DISABLE_CV_VISION:
                 raise HTTPException(
                     status_code=400,
                     detail="Unsupported file format. Please upload a PDF or image file (JPEG, PNG, GIF, WebP, BMP)."
                 )
-            try:
-                # Try as PDF first
-                parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
-                used_vision = True
-            except Exception as e:
+            else:
+                try:
+                    # Fall back to OpenAI Vision
+                    parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
+                    used_vision = True
+                except Exception as e:
                 logger.error(f"[CVParse] Failed to parse unknown file type: {e}")
                 raise HTTPException(
                     status_code=400,
@@ -1688,6 +1725,74 @@ Extract this information even if labels are slightly different."""
         text_content = extract_text_from_pdf(file_content)
         # Continue with text-based categorization
         return await categorize_document_with_ai_text(text_content, file_name, "application/pdf")
+
+async def _google_vision_ocr_image_bytes(image_bytes: bytes) -> str:
+    """Call Google Cloud Vision DOCUMENT_TEXT_DETECTION on a single in-memory image."""
+    if not GOOGLE_VISION_API_KEY:
+        return ""
+    try:
+        import base64, json, httpx
+        url = f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_API_KEY}"
+        payload = {
+            "requests": [{
+                "image": {"content": base64.b64encode(image_bytes).decode("utf-8")},
+                "features": [{"type": "DOCUMENT_TEXT_DETECTION"}]
+            }]
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, content=json.dumps(payload),
+                                     headers={"Content-Type": "application/json"})
+        if resp.status_code != 200:
+            logger.warning(f"[GoogleVision] HTTP {resp.status_code}: {resp.text[:200]}")
+            return ""
+        data = resp.json()
+        return (data.get("responses", [{}])[0]
+                    .get("fullTextAnnotation", {})
+                    .get("text", ""))
+    except Exception as e:
+        logger.warning(f"[GoogleVision] OCR call failed: {e}")
+        return ""
+
+async def extract_text_from_scanned_pdf_google_vision(pdf_content: bytes, max_pages: int = 3) -> str:
+    """
+    OCR a scanned/image-only PDF using Google Cloud Vision DOCUMENT_TEXT_DETECTION.
+    Cost: ~$1.50/1000 pages vs OpenAI Vision ~$15/1000 pages (10x cheaper).
+    Requires GOOGLE_VISION_API_KEY env var.
+    Returns extracted text, or empty string if API key not set or call fails.
+    """
+    if not GOOGLE_VISION_API_KEY:
+        logger.info("[GoogleVision] GOOGLE_VISION_API_KEY not set, skipping Google Vision OCR")
+        return ""
+
+    try:
+        import fitz  # PyMuPDF — already in requirements
+
+        pdf_doc = fitz.open(stream=pdf_content, filetype="pdf")
+        total_pages = len(pdf_doc)
+        pages_to_scan = min(max_pages, total_pages)
+        logger.info(f"[GoogleVision] Scanning {pages_to_scan}/{total_pages} pages via Google Cloud Vision OCR")
+
+        all_text_parts = []
+
+        for page_num in range(pages_to_scan):
+            page = pdf_doc[page_num]
+            # Render at 150 DPI — good enough for OCR, keeps payload small
+            mat = fitz.Matrix(150 / 72, 150 / 72)
+            pix = page.get_pixmap(matrix=mat)
+            img_bytes = pix.tobytes("png")
+
+            page_text = await _google_vision_ocr_image_bytes(img_bytes)
+            logger.info(f"[GoogleVision] Page {page_num+1}: extracted {len(page_text)} chars")
+            all_text_parts.append(page_text)
+
+        pdf_doc.close()
+        combined = "\n".join(all_text_parts)
+        logger.info(f"[GoogleVision] Total extracted: {len(combined)} chars across {pages_to_scan} page(s)")
+        return combined
+
+    except Exception as e:
+        logger.warning(f"[GoogleVision] OCR failed: {e}")
+        return ""
 
 def extract_text_from_pdf(pdf_content: bytes) -> str:
     """Extract text from PDF bytes using PyMuPDF (fitz) first, with PyPDF2 fallback"""
