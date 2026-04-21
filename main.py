@@ -96,9 +96,13 @@ CV_VISION_MODEL = os.getenv("CV_VISION_MODEL", "gpt-4o-mini")
 DISABLE_CV_VISION_RETRY = os.getenv("DISABLE_CV_VISION_RETRY", "false").lower() == "true"
 # Disable ALL vision-based CV parsing (zero OpenAI vision cost; text-only parsing only)
 DISABLE_CV_VISION = os.getenv("DISABLE_CV_VISION", "false").lower() == "true"
-# Google Cloud Vision API key — used as cheap OCR fallback for scanned PDFs when DISABLE_CV_VISION=true
-# Cost: $1.50/1000 pages vs OpenAI Vision $15/1000 pages (10x cheaper)
+# Google Cloud Vision — service account JSON stored as env var string.
+# Cost: $1.50/1000 pages vs OpenAI Vision $15/1000 pages (10x cheaper).
+# Set GOOGLE_APPLICATION_CREDENTIALS_JSON to the full contents of your service account JSON file.
+GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")
+# Keep legacy API key support as fallback
 GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "")
+GOOGLE_VISION_ENABLED = bool(GOOGLE_APPLICATION_CREDENTIALS_JSON or GOOGLE_VISION_API_KEY)
 DOCUMENT_VISION_MAX_PAGES = int(os.getenv("DOCUMENT_VISION_MAX_PAGES", "2"))
 DOCUMENT_TEXT_MIN_CHARS = int(os.getenv("DOCUMENT_TEXT_MIN_CHARS", "150"))
 DOCUMENT_VISION_MODEL = os.getenv("DOCUMENT_VISION_MODEL", "gpt-4o-mini")
@@ -1432,7 +1436,7 @@ async def parse_cv_from_url(
             logger.info(f"[CVParse] Image file detected ({file_type}).")
             profile_photo_url = extract_profile_photo_from_image(file_content, attachment_id or "unknown")
             
-            if DISABLE_CV_VISION or GOOGLE_VISION_API_KEY:
+            if DISABLE_CV_VISION or GOOGLE_VISION_ENABLED:
                 # Prefer Google Vision OCR (cheaper)
                 google_text = await _google_vision_ocr_image_bytes(file_content)
                 if google_text and len(google_text.strip()) > 50:
@@ -1442,7 +1446,7 @@ async def parse_cv_from_url(
                     logger.warning("[CVParse] Google Vision OCR insufficient and DISABLE_CV_VISION=true.")
                     raise HTTPException(
                         status_code=422,
-                        detail="Image-format CVs require Google Cloud Vision API key (GOOGLE_VISION_API_KEY). Please re-upload as PDF or set up Google Vision."
+                        detail="Image-format CVs require Google Cloud Vision (GOOGLE_APPLICATION_CREDENTIALS_JSON). Please re-upload as PDF or configure Google Vision."
                     )
                 else:
                     # Google Vision failed but OpenAI Vision is allowed
@@ -1727,21 +1731,46 @@ Extract this information even if labels are slightly different."""
         return await categorize_document_with_ai_text(text_content, file_name, "application/pdf")
 
 async def _google_vision_ocr_image_bytes(image_bytes: bytes) -> str:
-    """Call Google Cloud Vision DOCUMENT_TEXT_DETECTION on a single in-memory image."""
-    if not GOOGLE_VISION_API_KEY:
+    """
+    Call Google Cloud Vision DOCUMENT_TEXT_DETECTION on a single in-memory image.
+    Authenticates using service account JSON (GOOGLE_APPLICATION_CREDENTIALS_JSON env var)
+    or falls back to API key (GOOGLE_VISION_API_KEY env var).
+    """
+    if not GOOGLE_VISION_ENABLED:
         return ""
     try:
         import base64, json, httpx
-        url = f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_API_KEY}"
+
         payload = {
             "requests": [{
                 "image": {"content": base64.b64encode(image_bytes).decode("utf-8")},
                 "features": [{"type": "DOCUMENT_TEXT_DETECTION"}]
             }]
         }
+
+        # Prefer service account JSON auth (OAuth2 Bearer token)
+        if GOOGLE_APPLICATION_CREDENTIALS_JSON:
+            import google.oauth2.service_account as sa
+            import google.auth.transport.requests as ga_requests
+            creds = sa.Credentials.from_service_account_info(
+                json.loads(GOOGLE_APPLICATION_CREDENTIALS_JSON),
+                scopes=["https://www.googleapis.com/auth/cloud-vision"]
+            )
+            # Refresh token synchronously (fast — just a JWT exchange)
+            creds.refresh(ga_requests.Request())
+            url = "https://vision.googleapis.com/v1/images:annotate"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {creds.token}"
+            }
+        else:
+            # Fallback: plain API key
+            url = f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_API_KEY}"
+            headers = {"Content-Type": "application/json"}
+
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(url, content=json.dumps(payload),
-                                     headers={"Content-Type": "application/json"})
+            resp = await client.post(url, content=json.dumps(payload), headers=headers)
+
         if resp.status_code != 200:
             logger.warning(f"[GoogleVision] HTTP {resp.status_code}: {resp.text[:200]}")
             return ""
@@ -1757,11 +1786,11 @@ async def extract_text_from_scanned_pdf_google_vision(pdf_content: bytes, max_pa
     """
     OCR a scanned/image-only PDF using Google Cloud Vision DOCUMENT_TEXT_DETECTION.
     Cost: ~$1.50/1000 pages vs OpenAI Vision ~$15/1000 pages (10x cheaper).
-    Requires GOOGLE_VISION_API_KEY env var.
-    Returns extracted text, or empty string if API key not set or call fails.
+    Requires GOOGLE_APPLICATION_CREDENTIALS_JSON (service account) or GOOGLE_VISION_API_KEY env var.
+    Returns extracted text, or empty string if credentials not configured or call fails.
     """
-    if not GOOGLE_VISION_API_KEY:
-        logger.info("[GoogleVision] GOOGLE_VISION_API_KEY not set, skipping Google Vision OCR")
+    if not GOOGLE_VISION_ENABLED:
+        logger.info("[GoogleVision] No credentials configured, skipping Google Vision OCR")
         return ""
 
     try:

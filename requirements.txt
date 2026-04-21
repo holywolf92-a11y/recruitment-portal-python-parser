@@ -17,3 +17,5 @@ numpy>=1.24.0
 scipy>=1.11.0
 # Face detection - OpenCV headless (no compilation required, replaces dlib/face-recognition)
 opencv-python-headless>=4.8.0
+# Google Cloud Vision OCR - cheap scanned CV parsing (~$1.50/1000 pages)
+google-auth>=2.0.0
