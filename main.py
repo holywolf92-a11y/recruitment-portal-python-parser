@@ -94,6 +94,8 @@ CV_VISION_MAX_PAGES_FALLBACK = int(os.getenv("CV_VISION_MAX_PAGES_FALLBACK", "4"
 CV_VISION_MODEL = os.getenv("CV_VISION_MODEL", "gpt-4o-mini")
 # Disable the second-pass vision retry (saves ~50% of CV parsing cost)
 DISABLE_CV_VISION_RETRY = os.getenv("DISABLE_CV_VISION_RETRY", "false").lower() == "true"
+# Disable ALL vision-based CV parsing (zero OpenAI vision cost; text-only parsing only)
+DISABLE_CV_VISION = os.getenv("DISABLE_CV_VISION", "false").lower() == "true"
 DOCUMENT_VISION_MAX_PAGES = int(os.getenv("DOCUMENT_VISION_MAX_PAGES", "2"))
 DOCUMENT_TEXT_MIN_CHARS = int(os.getenv("DOCUMENT_TEXT_MIN_CHARS", "150"))
 DOCUMENT_VISION_MODEL = os.getenv("DOCUMENT_VISION_MODEL", "gpt-4o-mini")
@@ -1372,7 +1374,7 @@ async def parse_cv_from_url(
                 profile_photo_url = extract_profile_photo_from_pdf(file_content, attachment_id or "unknown")
                 
                 # Parse with OpenAI (fallback to Vision when text extraction is weak)
-                if len(text_content.strip()) < 200:
+                if not DISABLE_CV_VISION and len(text_content.strip()) < 200:
                     logger.warning(f"[CVParse] Low text extracted ({len(text_content)} chars). Using Vision parsing.")
                     parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
                     used_vision = True
@@ -1380,13 +1382,19 @@ async def parse_cv_from_url(
                     parsed_data = await parse_cv_with_openai(text_content, attachment_id or "unknown")
                 
                 # Check for placeholder data
-                if not used_vision and looks_placeholder_cv(parsed_data):
+                if not used_vision and not DISABLE_CV_VISION and looks_placeholder_cv(parsed_data):
                     logger.warning("[CVParse] Placeholder data detected. Retrying with Vision parsing.")
                     parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
                     used_vision = True
                     
             except Exception as pdf_error:
                 logger.error(f"[CVParse] PDF extraction failed: {pdf_error}")
+                if DISABLE_CV_VISION:
+                    logger.warning("[CVParse] PDF extraction failed and DISABLE_CV_VISION=true, skipping Vision fallback.")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to parse PDF (Vision API disabled): {str(pdf_error)}"
+                    )
                 logger.warning("[CVParse] PDF extraction failed. Trying Vision API fallback...")
                 # Fallback to Vision API for corrupted/scanned PDFs
                 try:
@@ -1402,6 +1410,12 @@ async def parse_cv_from_url(
         # Strategy 2: If it's an image, go directly to Vision API
         elif file_type in ['jpeg', 'png', 'gif', 'webp', 'bmp']:
             logger.info(f"[CVParse] Image file detected ({file_type}). Using Vision API directly.")
+            if DISABLE_CV_VISION:
+                logger.warning("[CVParse] DISABLE_CV_VISION=true, cannot parse image-format CVs without Vision API.")
+                raise HTTPException(
+                    status_code=422,
+                    detail="Image-format CVs require Vision API which is currently disabled. Please re-upload as PDF."
+                )
             try:
                 # Parse CV content with Vision API
                 parsed_data = await parse_cv_with_vision_image(file_content, attachment_id or "unknown", file_type)
@@ -1420,6 +1434,12 @@ async def parse_cv_from_url(
         # Strategy 3: Unknown file type - try Vision API as last resort
         else:
             logger.warning(f"[CVParse] Unknown file type. Attempting Vision API as last resort...")
+            if DISABLE_CV_VISION:
+                logger.warning("[CVParse] DISABLE_CV_VISION=true, skipping Vision fallback for unknown file type.")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unsupported file format. Please upload a PDF or image file (JPEG, PNG, GIF, WebP, BMP)."
+                )
             try:
                 # Try as PDF first
                 parsed_data = await parse_cv_with_vision(file_content, attachment_id or "unknown")
