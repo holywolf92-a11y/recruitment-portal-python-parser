@@ -96,6 +96,19 @@ CV_VISION_MODEL = os.getenv("CV_VISION_MODEL", "gpt-4o-mini")
 DISABLE_CV_VISION_RETRY = os.getenv("DISABLE_CV_VISION_RETRY", "false").lower() == "true"
 # Disable ALL vision-based CV parsing (zero OpenAI vision cost; text-only parsing only)
 DISABLE_CV_VISION = os.getenv("DISABLE_CV_VISION", "false").lower() == "true"
+# Disable OpenAI Vision for document categorization (use text-only path instead)
+# Set to true to stop OpenAI Vision calls on the /categorize-document endpoint
+DISABLE_DOCUMENT_VISION = os.getenv("DISABLE_DOCUMENT_VISION", "false").lower() == "true"
+
+# File extensions that are immediately rejected without any API calls
+# These are Windows shortcuts, binaries, archives, and other non-document files
+UNSUPPORTED_EXTENSIONS = {
+    '.lnk', '.exe', '.dll', '.bat', '.cmd', '.msi', '.scr',
+    '.zip', '.rar', '.7z', '.tar', '.gz',
+    '.mp4', '.mp3', '.avi', '.mov', '.mkv', '.wav', '.flac',
+    '.psd', '.ai', '.indd', '.sketch',
+    '.db', '.sqlite', '.sql',
+}
 # Google Cloud Vision — service account JSON stored as env var string.
 # Cost: $1.50/1000 pages vs OpenAI Vision $15/1000 pages (10x cheaper).
 # Set GOOGLE_APPLICATION_CREDENTIALS_JSON to the full contents of your service account JSON file.
@@ -1355,6 +1368,13 @@ async def parse_cv_from_url(
 
         if not file_url:
             raise HTTPException(status_code=400, detail="file_url is required")
+
+        # Reject unsupported file types immediately (no API calls)
+        _cv_file_name = payload.get('file_name', file_url.split('/')[-1].split('?')[0])
+        _cv_ext = os.path.splitext(_cv_file_name.lower())[1] if _cv_file_name else ''
+        if _cv_ext in UNSUPPORTED_EXTENSIONS:
+            logger.info(f"[CVParse] Rejected unsupported file type '{_cv_ext}': {_cv_file_name}")
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {_cv_ext}. Only PDF and image files are accepted.")
 
         # Fetch file from URL
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -2624,7 +2644,21 @@ async def categorize_document(
         
         if not file_content:
             raise HTTPException(status_code=400, detail="file_content is required")
-        
+
+        # Reject unsupported file types immediately (no API calls)
+        _ext = os.path.splitext(file_name.lower())[1] if file_name else ''
+        if _ext in UNSUPPORTED_EXTENSIONS:
+            logger.info(f"[CategorizeDocument] Rejected unsupported file type '{_ext}': {file_name}")
+            return {
+                "success": True,
+                "category": "unsupported",
+                "confidence": 1.0,
+                "ocr_confidence": None,
+                "extracted_identity": None,
+                "mismatch_fields": [],
+                "raw_text": None,
+            }
+
         # Validate base64 string
         if isinstance(file_content, str):
             original_content = file_content
@@ -2687,15 +2721,38 @@ async def categorize_document(
                     f"[CategorizeDocument] PDF text extracted ({len(file_text)} chars). Using text categorization for {file_name}"
                 )
                 result = await categorize_document_with_ai_text(file_text, file_name, mime_type)
+            elif DISABLE_DOCUMENT_VISION:
+                # Vision disabled — return unknown rather than call OpenAI Vision
+                logger.info(
+                    f"[CategorizeDocument] PDF text weak ({len(file_text)} chars) and DISABLE_DOCUMENT_VISION=true. Returning unknown for {file_name}"
+                )
+                result = {"category": "unknown", "confidence": 0.0, "extracted_identity": None}
             else:
                 logger.info(
                     f"[CategorizeDocument] PDF text weak ({len(file_text)} chars). Falling back to capped vision for {file_name}"
                 )
                 result = await categorize_document_with_vision_api(file_bytes, file_name, is_pdf=True)
         elif mime_type in ["image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"]:
-            # Image: Send directly to Vision API (just encode as base64)
-            logger.info(f"[CategorizeDocument] Image detected - sending directly to Vision API: {file_name}")
-            result = await categorize_document_with_vision_api(file_bytes, file_name, is_pdf=False)
+            if DISABLE_DOCUMENT_VISION:
+                # Vision disabled — use Google Vision OCR text extraction then text API
+                logger.info(f"[CategorizeDocument] Image detected, DISABLE_DOCUMENT_VISION=true. Using OCR+text path for {file_name}")
+                ocr_text = ""
+                if GOOGLE_VISION_ENABLED:
+                    try:
+                        import base64 as _b64
+                        _img_b64 = _b64.b64encode(file_bytes).decode('utf-8')
+                        ocr_text = await google_vision_ocr_image(_img_b64)
+                    except Exception as ocr_err:
+                        logger.warning(f"[CategorizeDocument] Google Vision OCR failed for {file_name}: {ocr_err}")
+                if len(ocr_text.strip()) >= 50:
+                    result = await categorize_document_with_ai_text(ocr_text, file_name, mime_type)
+                else:
+                    logger.info(f"[CategorizeDocument] Insufficient OCR text for {file_name}. Returning unknown.")
+                    result = {"category": "unknown", "confidence": 0.0, "extracted_identity": None}
+            else:
+                # Image: Send directly to Vision API (just encode as base64)
+                logger.info(f"[CategorizeDocument] Image detected - sending directly to Vision API: {file_name}")
+                result = await categorize_document_with_vision_api(file_bytes, file_name, is_pdf=False)
         else:
             # Text files: Extract text and use text-based API
             try:
