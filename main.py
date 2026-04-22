@@ -1700,11 +1700,32 @@ Extract this information even if labels are slightly different."""
         logger.error(f"[VisionAPI] Error: {e}")
         import traceback
         logger.error(f"[VisionAPI] Traceback: {traceback.format_exc()}")
-        # Fallback to text extraction if Vision API fails
-        logger.warning(f"[VisionAPI] Falling back to text extraction method")
-        text_content = extract_text_from_pdf(file_content)
-        # Continue with text-based categorization
-        return await categorize_document_with_ai_text(text_content, file_name, "application/pdf")
+        logger.warning(f"[VisionAPI] Falling back to OCR/text extraction method")
+
+        if is_pdf:
+            ocr_text = await extract_text_from_scanned_pdf_google_vision(file_content)
+            if ocr_text and len(ocr_text.strip()) >= 50:
+                logger.info(f"[VisionAPI] Google Vision OCR recovered {len(ocr_text)} chars from PDF {file_name}")
+                return await categorize_document_with_ai_text(ocr_text, file_name, "application/pdf")
+
+            logger.warning(f"[VisionAPI] Google Vision OCR unavailable or insufficient for PDF {file_name}; trying native PDF text extraction")
+            text_content = extract_text_from_pdf(file_content)
+            return await categorize_document_with_ai_text(text_content, file_name, "application/pdf")
+
+        ocr_text = await _google_vision_ocr_image_bytes(file_content)
+        if ocr_text and len(ocr_text.strip()) >= 50:
+            logger.info(f"[VisionAPI] Google Vision OCR recovered {len(ocr_text)} chars from image {file_name}")
+            return await categorize_document_with_ai_text(ocr_text, file_name, "image/jpeg")
+
+        logger.warning(f"[VisionAPI] Google Vision OCR unavailable or insufficient for image {file_name}; returning unknown")
+        return {
+            "success": True,
+            "category": "unknown",
+            "confidence": 0.0,
+            "ocr_confidence": 0.0,
+            "extracted_identity": None,
+            "raw_text": None,
+        }
 
 async def _google_vision_ocr_image_bytes(image_bytes: bytes) -> str:
     """
