@@ -281,9 +281,22 @@ IDENTITY_EXTRACT_DOCS = {
 
 _PLACEHOLDER_VALUES = {"", "missing", "null", "undefined", "n/a", "na", "none", "not provided"}
 _DATE_RE = r"(?:\d{2}[/-]\d{2}[/-]\d{2,4}|\d{4}[/-]\d{2}[/-]\d{2})"
-_CNIC_RE_STR = r"\b\d{5}-\d{7}-\d\b|\b\d{13}\b"
-_PASSPORT_RE_STR = r"\b[A-Z]{1,2}\d{6,9}\b"
+_CNIC_RE_STR = r"\b\d{5}\s*[-–—]?\s*\d{7}\s*[-–—]?\s*\d\b|\b\d{13}\b"
+_PASSPORT_RE_STR = r"\b[A-Z]{1,2}\s*\d{7,9}\b"
 _PHONE_RE_STR = r"(?:\+\d{1,3}[\s-]?)?(?:\(?\d{2,4}\)?[\s-]?)?\d{3,4}[\s-]?\d{4,7}"
+_PAKISTANI_PASSPORT_TITLE_RE = re.compile(
+    r"(?:islamic\s+republic\s+of\s+pakistan.*passport|passport.*islamic\s+republic\s+of\s+pakistan|\bcountry\s*code\b\s*[:#-]?\s*pak\b|\btype\b\s*[:#-]?\s*p\b)",
+    re.I | re.S,
+)
+_PAKISTANI_PASSPORT_NO_RE = re.compile(r"\b[A-Z]{2}\s*\d{7}\b", re.I)
+_PAKISTANI_CNIC_LAYOUT_RE = re.compile(
+    r"(?:computeri[sz]ed\s+national\s+identity\s+card|national\s+identity\s+card|\bcnic\b|identity\s*number|nicop|smart\s+card)",
+    re.I,
+)
+_PAKISTANI_POLICE_CERT_LAYOUT_RE = re.compile(
+    r"(?:police\s+character\s+certificate|police\s+clearance\s+certificate|certificate\s+of\s+character|character\s+and\s+antecedents|district\s+police\s+officer|superintendent\s+of\s+police|no\s+criminal\s+record|for\s+immigration\s+purpose|for\s+travel(?:ling)?\s+abroad)",
+    re.I,
+)
 
 
 def _clean_text(value: Any) -> str | None:
@@ -347,6 +360,14 @@ def _extract_labeled_value(text: str, labels: list[str], pattern: str) -> str | 
     return None
 
 
+def _extract_first_regex(text: str, patterns: list[re.Pattern[str] | str]) -> str | None:
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I | re.M) if isinstance(pattern, str) else pattern.search(text)
+        if match:
+            return _clean_text(match.group(1) if match.lastindex else match.group(0))
+    return None
+
+
 def _normalize_name(value: str | None) -> str | None:
     text = _clean_text(value)
     if not text:
@@ -361,9 +382,18 @@ def _normalize_name(value: str | None) -> str | None:
 
 
 def _extract_name(text: str, doc_type: str) -> str | None:
+    if doc_type == "passport":
+        surname = _extract_labeled_value(text, [r"surname"], r"[^\n]{2,60}")
+        given_names = _extract_labeled_value(text, [r"given\s+name(?:s)?", r"given\s+names"], r"[^\n]{2,60}")
+        if surname or given_names:
+            combined = " ".join(part for part in [given_names, surname] if part)
+            candidate = _normalize_name(combined)
+            if candidate:
+                return candidate
+
     labeled = _extract_labeled_value(
         text,
-        [r"full\s+name", r"name", r"surname", r"given\s+name", r"applicant\s+name", r"holder\s+name"],
+        [r"full\s+name", r"name", r"applicant\s+name", r"holder\s+name"],
         r"[^\n]{3,80}",
     )
     if labeled:
@@ -379,11 +409,27 @@ def _extract_name(text: str, doc_type: str) -> str | None:
 
 
 def _extract_identity_from_text(text: str, doc_type: str) -> dict[str, Any]:
+    passport_no = None
+    if doc_type == "passport":
+        passport_no = _extract_labeled_value(
+            text,
+            [r"passport(?:\s*(?:no|number))?", r"document\s+no", r"passport\s*#", r"pp\s*no"],
+            _PASSPORT_RE_STR,
+        ) or _extract_first_regex(text, [_PAKISTANI_PASSPORT_NO_RE])
+
+    cnic = None
+    if doc_type == "cnic":
+        cnic = _extract_labeled_value(
+            text,
+            [r"cnic", r"identity\s*number", r"national\s+identity\s+card", r"nic\s*no"],
+            _CNIC_RE_STR,
+        ) or _extract_first_regex(text, [_CNIC_RE_STR])
+
     identity: dict[str, Any] = {
         "name": _extract_name(text, doc_type),
-        "father_name": _extract_labeled_value(text, [r"father'?s?\s+name", r"father", r"s\/o"], r"[^\n]{3,80}"),
-        "cnic": _extract_labeled_value(text, [r"cnic", r"national\s+id(?:\s+card)?", r"id\s*card"], _CNIC_RE_STR) or (re.search(_CNIC_RE_STR, text) or [None])[0],
-        "passport_no": _extract_labeled_value(text, [r"passport(?:\s*(?:no|number))?", r"pp\s*no"], _PASSPORT_RE_STR) or (re.search(_PASSPORT_RE_STR, text) or [None])[0],
+        "father_name": _extract_labeled_value(text, [r"father'?s?\s+name", r"husband'?s?\s+name", r"s\/o", r"d\/o"], r"[^\n]{3,80}"),
+        "cnic": cnic or _extract_labeled_value(text, [r"cnic", r"national\s+id(?:\s+card)?", r"id\s*card"], _CNIC_RE_STR) or _extract_first_regex(text, [_CNIC_RE_STR]),
+        "passport_no": passport_no or _extract_labeled_value(text, [r"passport(?:\s*(?:no|number))?", r"pp\s*no", r"document\s+no"], _PASSPORT_RE_STR) or _extract_first_regex(text, [_PAKISTANI_PASSPORT_NO_RE, _PASSPORT_RE_STR]),
         "email": (re.search(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", text, re.I) or [None])[0],
         "phone": (re.search(_PHONE_RE_STR, text) or [None])[0],
         "date_of_birth": _extract_labeled_value(text, [r"date\s+of\s+birth", r"birth\s+date", r"d\.o\.b", r"dob"], _DATE_RE),
@@ -413,19 +459,24 @@ def _classify_text_document(text: str) -> tuple[str, float]:
 
     has_mrz = bool(re.search(r"[A-Z0-9<]{20,}", text))
     has_cnic = bool(re.search(_CNIC_RE_STR, text))
-    has_passport_no = bool(re.search(_PASSPORT_RE_STR, text))
+    has_passport_no = bool(_PAKISTANI_PASSPORT_NO_RE.search(text) or re.search(_PASSPORT_RE_STR, text))
+    has_pakistani_passport_layout = bool(_PAKISTANI_PASSPORT_TITLE_RE.search(text))
+    has_pakistani_cnic_layout = bool(_PAKISTANI_CNIC_LAYOUT_RE.search(text))
+    has_pakistani_police_layout = bool(_PAKISTANI_POLICE_CERT_LAYOUT_RE.search(text))
 
     passport_score = 0
     passport_score += 3 if "passport" in lower else 0
+    passport_score += 4 if has_pakistani_passport_layout else 0
     passport_score += 2 if has_mrz else 0
     passport_score += 1 if has_passport_no else 0
-    passport_score += sum(1 for kw in ["place of issue", "date of issue", "date of expiry", "nationality"] if kw in lower)
+    passport_score += sum(1 for kw in ["place of issue", "date of issue", "date of expiry", "nationality", "country code", "surname", "given name"] if kw in lower)
 
     cnic_score = 0
     cnic_score += 3 if "cnic" in lower else 0
+    cnic_score += 4 if has_pakistani_cnic_layout else 0
     cnic_score += 2 if "national identity card" in lower else 0
     cnic_score += 2 if has_cnic else 0
-    cnic_score += sum(1 for kw in ["father name", "id card", "holder"] if kw in lower)
+    cnic_score += sum(1 for kw in ["father name", "husband name", "identity number", "id card", "gender", "country of stay"] if kw in lower)
 
     driving_score = 0
     driving_score += 3 if "driving license" in lower or "driving licence" in lower else 0
@@ -434,8 +485,9 @@ def _classify_text_document(text: str) -> tuple[str, float]:
 
     police_score = 0
     police_score += 3 if "police character" in lower else 0
+    police_score += 4 if has_pakistani_police_layout else 0
     police_score += 3 if "police clearance" in lower or "clearance certificate" in lower else 0
-    police_score += sum(1 for kw in ["criminal record", "superintendent of police", "character certificate"] if kw in lower)
+    police_score += sum(1 for kw in ["criminal record", "superintendent of police", "district police officer", "character certificate", "for immigration", "for traveling abroad"] if kw in lower)
 
     medical_score = 0
     medical_score += 3 if "medical certificate" in lower or "medical report" in lower else 0
