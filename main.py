@@ -106,6 +106,7 @@ GOOGLE_VISION_ENABLED = bool(GOOGLE_APPLICATION_CREDENTIALS_JSON or GOOGLE_VISIO
 DOCUMENT_VISION_MAX_PAGES = int(os.getenv("DOCUMENT_VISION_MAX_PAGES", "2"))
 DOCUMENT_TEXT_MIN_CHARS = int(os.getenv("DOCUMENT_TEXT_MIN_CHARS", "150"))
 DOCUMENT_VISION_MODEL = os.getenv("DOCUMENT_VISION_MODEL", "gpt-4o-mini")
+CV_PARSE_TEXT_INPUT_LIMIT = int(os.getenv("CV_PARSE_TEXT_INPUT_LIMIT", "6000"))
 
 # Normalize SUPABASE_URL for storage3 client which expects a trailing slash
 # Keep a clean version without trailing slash for public URL generation
@@ -461,9 +462,8 @@ Return ONLY valid JSON:
         raise HTTPException(status_code=500, detail=f"Document categorization failed: {str(e)}")
 
 def build_cv_prompt(content: str, from_images: bool = False) -> str:
-    # Do not aggressively truncate text-based PDFs; later pages often contain
-    # education, licenses/registrations, and detailed experience.
-    content_section = "CV Images are attached." if from_images else f"CV Content:\n{content[:20000]}"
+    # Keep the parser payload intentionally bounded so input-token spend stays predictable.
+    content_section = "CV Images are attached." if from_images else f"CV Content:\n{content[:CV_PARSE_TEXT_INPUT_LIMIT]}"
     return f"""
 You are a CV/Resume parser. Extract structured information from the following CV content.
 Return ONLY valid JSON with these exact fields (use null for missing data):
@@ -694,7 +694,7 @@ async def parse_cv_with_openai(content: str, filename: str) -> dict:
         # Keep truncated to avoid oversized payloads.
         if isinstance(content, str) and content:
             parsed_data['raw_text_length'] = len(content)
-            parsed_data['raw_text'] = content[:20000]
+            parsed_data['raw_text'] = content[:CV_PARSE_TEXT_INPUT_LIMIT]
         
         # Post-processing: Normalize driver positions
         position = parsed_data.get('position', '').strip() if parsed_data.get('position') else ''
@@ -1410,7 +1410,7 @@ async def parse_cv_from_url(
                         detail=f"Failed to parse PDF with text extraction and Google Vision OCR: {str(pdf_error)}"
                     )
         
-        # Strategy 2: If it's an image, use Google Vision OCR or OpenAI Vision
+        # Strategy 2: If it's an image, use Google Vision OCR and then parse the extracted text.
         elif file_type in ['jpeg', 'png', 'gif', 'webp', 'bmp']:
             logger.info(f"[CVParse] Image file detected ({file_type}).")
             profile_photo_url = extract_profile_photo_from_image(file_content, attachment_id or "unknown")
@@ -1433,7 +1433,7 @@ async def parse_cv_from_url(
                     detail="Image-format CVs require Google Cloud Vision (GOOGLE_APPLICATION_CREDENTIALS_JSON not configured). Please re-upload as PDF."
                 )
         
-        # Strategy 3: Unknown file type - try Google Vision OCR then OpenAI Vision as last resort
+        # Strategy 3: Unknown file type - try Google Vision OCR before failing.
         else:
             logger.warning(f"[CVParse] Unknown file type. Attempting Google Vision OCR as last resort...")
             google_text = await extract_text_from_scanned_pdf_google_vision(file_content)
