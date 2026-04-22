@@ -1,10 +1,10 @@
 """
 Unified document split & classification.
 
-Dual OCR + Vision fallback:
-- Primary: AWS Textract + OpenAI Vision (layout + classify).
-- Fallback: OpenAI Vision only (layout inference + classify).
-Engine chosen automatically; processing never fails due to Textract.
+OCR-first classification:
+- Primary: Google Vision OCR for page text.
+- Classification: deterministic rules over OCR text.
+- Textract/OpenAI are not required for the normal split path.
 """
 
 from __future__ import annotations
@@ -18,6 +18,10 @@ import re
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")
+GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "")
+GOOGLE_VISION_ENABLED = bool(GOOGLE_APPLICATION_CREDENTIALS_JSON or GOOGLE_VISION_API_KEY)
 
 try:
     from textract_layout import (
@@ -275,6 +279,217 @@ IDENTITY_EXTRACT_DOCS = {
     "medical_reports",              # need name
 }
 
+_PLACEHOLDER_VALUES = {"", "missing", "null", "undefined", "n/a", "na", "none", "not provided"}
+_DATE_RE = r"(?:\d{2}[/-]\d{2}[/-]\d{2,4}|\d{4}[/-]\d{2}[/-]\d{2})"
+_CNIC_RE_STR = r"\b\d{5}-\d{7}-\d\b|\b\d{13}\b"
+_PASSPORT_RE_STR = r"\b[A-Z]{1,2}\d{6,9}\b"
+_PHONE_RE_STR = r"(?:\+\d{1,3}[\s-]?)?(?:\(?\d{2,4}\)?[\s-]?)?\d{3,4}[\s-]?\d{4,7}"
+
+
+def _clean_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text or text.lower() in _PLACEHOLDER_VALUES:
+        return None
+    return text
+
+
+async def _google_vision_ocr_image_bytes(image_bytes: bytes) -> str:
+    if not GOOGLE_VISION_ENABLED:
+        return ""
+
+    try:
+        import httpx
+
+        payload = {
+            "requests": [{
+                "image": {"content": base64.b64encode(image_bytes).decode("utf-8")},
+                "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
+            }]
+        }
+
+        if GOOGLE_APPLICATION_CREDENTIALS_JSON:
+            import google.auth.transport.requests as ga_requests
+            import google.oauth2.service_account as sa
+
+            creds = sa.Credentials.from_service_account_info(
+                json.loads(GOOGLE_APPLICATION_CREDENTIALS_JSON),
+                scopes=["https://www.googleapis.com/auth/cloud-vision"],
+            )
+            creds.refresh(ga_requests.Request())
+            url = "https://vision.googleapis.com/v1/images:annotate"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {creds.token}",
+            }
+        else:
+            url = f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_API_KEY}"
+            headers = {"Content-Type": "application/json"}
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, content=json.dumps(payload), headers=headers)
+
+        if resp.status_code != 200:
+            logger.warning(f"[Split] Google Vision HTTP {resp.status_code}: {resp.text[:200]}")
+            return ""
+
+        data = resp.json()
+        return (data.get("responses", [{}])[0].get("fullTextAnnotation", {}).get("text", "") or "").strip()
+    except Exception as e:
+        logger.warning(f"[Split] Google Vision OCR failed: {e}")
+        return ""
+
+
+def _extract_labeled_value(text: str, labels: list[str], pattern: str) -> str | None:
+    for label in labels:
+        match = re.search(rf"(?im)\b{label}\b\s*[:#-]?\s*({pattern})", text)
+        if match:
+            return _clean_text(match.group(1))
+    return None
+
+
+def _normalize_name(value: str | None) -> str | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+    text = re.sub(r"\s+", " ", text).strip(" -:")
+    if len(text) < 3:
+        return None
+    lowered = text.lower()
+    if any(tok in lowered for tok in ["passport", "cnic", "certificate", "license", "licence", "medical", "police", "curriculum vitae", "resume", "objective", "professional summary"]):
+        return None
+    return text
+
+
+def _extract_name(text: str, doc_type: str) -> str | None:
+    labeled = _extract_labeled_value(
+        text,
+        [r"full\s+name", r"name", r"surname", r"given\s+name", r"applicant\s+name", r"holder\s+name"],
+        r"[^\n]{3,80}",
+    )
+    if labeled:
+        return _normalize_name(labeled)
+
+    if doc_type == "cv_resume":
+        for line in [ln.strip() for ln in text.splitlines()[:6] if ln.strip()]:
+            if len(line.split()) >= 2 and len(line.split()) <= 5 and not re.search(r"\d", line):
+                candidate = _normalize_name(line)
+                if candidate:
+                    return candidate
+    return None
+
+
+def _extract_identity_from_text(text: str, doc_type: str) -> dict[str, Any]:
+    identity: dict[str, Any] = {
+        "name": _extract_name(text, doc_type),
+        "father_name": _extract_labeled_value(text, [r"father'?s?\s+name", r"father", r"s\/o"], r"[^\n]{3,80}"),
+        "cnic": _extract_labeled_value(text, [r"cnic", r"national\s+id(?:\s+card)?", r"id\s*card"], _CNIC_RE_STR) or (re.search(_CNIC_RE_STR, text) or [None])[0],
+        "passport_no": _extract_labeled_value(text, [r"passport(?:\s*(?:no|number))?", r"pp\s*no"], _PASSPORT_RE_STR) or (re.search(_PASSPORT_RE_STR, text) or [None])[0],
+        "email": (re.search(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", text, re.I) or [None])[0],
+        "phone": (re.search(_PHONE_RE_STR, text) or [None])[0],
+        "date_of_birth": _extract_labeled_value(text, [r"date\s+of\s+birth", r"birth\s+date", r"d\.o\.b", r"dob"], _DATE_RE),
+        "dob": None,
+        "document_number": None,
+        "nationality": _extract_labeled_value(text, [r"nationality", r"citizenship", r"country\s+of\s+origin"], r"[^\n]{2,40}"),
+        "passport_expiry": _extract_labeled_value(text, [r"date\s+of\s+expiry", r"expiry\s+date", r"date\s+expiry"], _DATE_RE),
+        "expiry_date": None,
+        "issue_date": _extract_labeled_value(text, [r"date\s+of\s+issue", r"issue\s+date"], _DATE_RE),
+        "place_of_issue": _extract_labeled_value(text, [r"place\s+of\s+issue", r"issued\s+at"], r"[^\n]{2,60}"),
+    }
+
+    if not identity["document_number"]:
+        identity["document_number"] = identity["cnic"] or identity["passport_no"]
+    if identity["date_of_birth"]:
+        identity["dob"] = identity["date_of_birth"]
+    if identity["passport_expiry"]:
+        identity["expiry_date"] = identity["passport_expiry"]
+
+    return _normalize_identity(identity)
+
+
+def _classify_text_document(text: str) -> tuple[str, float]:
+    lower = (text or "").lower()
+    if not lower.strip():
+        return "other_documents", 0.0
+
+    has_mrz = bool(re.search(r"[A-Z0-9<]{20,}", text))
+    has_cnic = bool(re.search(_CNIC_RE_STR, text))
+    has_passport_no = bool(re.search(_PASSPORT_RE_STR, text))
+
+    passport_score = 0
+    passport_score += 3 if "passport" in lower else 0
+    passport_score += 2 if has_mrz else 0
+    passport_score += 1 if has_passport_no else 0
+    passport_score += sum(1 for kw in ["place of issue", "date of issue", "date of expiry", "nationality"] if kw in lower)
+
+    cnic_score = 0
+    cnic_score += 3 if "cnic" in lower else 0
+    cnic_score += 2 if "national identity card" in lower else 0
+    cnic_score += 2 if has_cnic else 0
+    cnic_score += sum(1 for kw in ["father name", "id card", "holder"] if kw in lower)
+
+    driving_score = 0
+    driving_score += 3 if "driving license" in lower or "driving licence" in lower else 0
+    driving_score += 2 if "license no" in lower or "licence no" in lower else 0
+    driving_score += sum(1 for kw in ["vehicle", "authority", "validity", "dl no"] if kw in lower)
+
+    police_score = 0
+    police_score += 3 if "police character" in lower else 0
+    police_score += 3 if "police clearance" in lower or "clearance certificate" in lower else 0
+    police_score += sum(1 for kw in ["criminal record", "superintendent of police", "character certificate"] if kw in lower)
+
+    medical_score = 0
+    medical_score += 3 if "medical certificate" in lower or "medical report" in lower else 0
+    medical_score += sum(1 for kw in ["hospital", "clinic", "diagnosis", "fit for", "laboratory", "x-ray", "blood group"] if kw in lower)
+
+    cv_score = 0
+    cv_score += 4 if "curriculum vitae" in lower or "resume" in lower else 0
+    cv_score += sum(1 for kw in ["objective", "experience", "skills", "education", "references", "professional summary", "employment history"] if kw in lower)
+
+    educational_score = 0
+    educational_score += sum(2 for kw in ["transcript", "marksheet", "semester", "cgpa", "gpa", "board of", "roll no", "registration no"] if kw in lower)
+    educational_score += sum(1 for kw in ["degree", "diploma", "bachelor", "master", "intermediate", "matric", "university", "college", "school"] if kw in lower)
+
+    certificate_score = 0
+    certificate_score += 2 if "certificate" in lower else 0
+    certificate_score += sum(1 for kw in ["training", "completion", "attendance", "course", "workshop", "seminar", "navttc", "experience certificate", "service certificate"] if kw in lower)
+
+    if passport_score >= 4:
+        return "passport", 0.97
+    if cnic_score >= 4:
+        return "cnic", 0.98
+    if driving_score >= 4:
+        return "driving_license", 0.95
+    if police_score >= 4:
+        return "police_character_certificate", 0.95
+    if medical_score >= 4:
+        return "medical_reports", 0.93
+    if cv_score >= 4:
+        return "cv_resume", 0.93
+    if educational_score >= 5 and cv_score < 3:
+        return "educational_documents", 0.91
+    if "navttc" in lower:
+        return "navttc_reports", 0.9
+    if certificate_score >= 3 and cv_score < 3:
+        if "experience certificate" in lower or "service certificate" in lower or "employment certificate" in lower:
+            return "experience_certificates", 0.9
+        return "certificates", 0.9
+    return "other_documents", 0.45
+
+
+async def _classify_page_with_google_ocr(image_base64: str) -> dict[str, Any]:
+    image_bytes = base64.b64decode(image_base64)
+    text = await _google_vision_ocr_image_bytes(image_bytes)
+    category, confidence = _classify_text_document(text)
+    identity = _extract_identity_from_text(text, category) if category in IDENTITY_EXTRACT_DOCS else _normalize_identity({})
+    return {
+        "layout": "single",
+        "regions": [],
+        "category": category,
+        "confidence": confidence,
+        "extracted_identity": identity,
+        "raw_text": text,
+    }
+
 
 def _normalize_identity(raw: dict) -> dict:
     out = {k: raw.get(k) for k in (
@@ -454,124 +669,13 @@ def _should_reclassify(
 
 
 async def classify_page_vision(image_base64: str, openai_api_key: str) -> dict[str, Any]:
-    """
-    Two-pass Vision classification.
-
-    Pass 1 — low-detail triage (gpt-4o-mini, detail:low, max_tokens:100)
-        Always runs. Returns category + confidence only. Very cheap.
-
-    Pass 2 — high-detail identity extraction (gpt-4o-mini, detail:high, max_tokens:500)
-        Only runs when the category is in IDENTITY_EXTRACT_DOCS.
-        Extracts all identity fields (name, passport_no, CNIC, etc.).
-
-    For all other categories (certificates, medical, navttc, etc.) Pass 2 is skipped —
-    only the category classification is returned and identity is left empty.
-    """
-    from openai import AsyncOpenAI
-
-    client = AsyncOpenAI(api_key=openai_api_key)
-
-    # ──────────────────────────────────────────────────────────────
-    # Pass 1: Low-detail, classify only (cheap — 85 fixed tokens)
-    # ──────────────────────────────────────────────────────────────
-    triage_messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": VISION_TRIAGE_PROMPT},
-                {"type": "image_url", "image_url": {
-                    "url": f"data:image/jpeg;base64,{image_base64}",
-                    "detail": "low",
-                }},
-            ],
-        }
-    ]
-    triage_resp = await client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=triage_messages,
-        temperature=0.1,
-        max_tokens=100,
-    )
-    triage_text = triage_resp.choices[0].message.content.strip()
-    try:
-        triage_data = _parse_vision_json(triage_text)
-    except Exception:
-        logger.warning(f"[Split] Triage JSON parse failed: {triage_text[:120]!r} — using other_documents")
-        triage_data = {"category": "other_documents", "confidence": 0.0}
-
-    raw_cat = (triage_data.get("category") or "other_documents").strip()
-    triage_conf = float(triage_data.get("confidence") or 0.0)
-
-    # ──────────────────────────────────────────────────────────────
-    # Pass 2: High-detail identity extraction (only if needed)
-    # ──────────────────────────────────────────────────────────────
-    if raw_cat in IDENTITY_EXTRACT_DOCS:
-        detail_messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": VISION_PROMPT},
-                    {"type": "image_url", "image_url": {
-                        "url": f"data:image/jpeg;base64,{image_base64}",
-                        "detail": "high",
-                    }},
-                ],
-            }
-        ]
-        try:
-            detail_resp = await client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=detail_messages,
-                temperature=0.1,
-                max_tokens=500,
-            )
-            detail_text = detail_resp.choices[0].message.content.strip()
-            data = _parse_vision_json(detail_text)
-            identity = data.get("extracted_identity") or {}
-            data["extracted_identity"] = _normalize_identity(identity)
-            # Prefer the triage category if the high-detail pass returned lower confidence
-            if float(data.get("confidence") or 0.0) < triage_conf * 0.9:
-                data["category"] = raw_cat
-                data["confidence"] = triage_conf
-            return data
-        except Exception as e:
-            logger.warning(f"[Split] High-detail pass failed ({e}), falling back to triage result")
-
-    # Pass 2 skipped or failed — return triage result with empty identity
-    return {
-        "category": raw_cat,
-        "confidence": triage_conf,
-        "extracted_identity": _normalize_identity({}),
-    }
+    del openai_api_key
+    return await _classify_page_with_google_ocr(image_base64)
 
 
 async def classify_page_vision_with_layout(image_base64: str, openai_api_key: str) -> dict[str, Any]:
-    """Vision layout + classification. Returns layout, category, confidence, identity, regions (if multi)."""
-    from openai import AsyncOpenAI
-
-    client = AsyncOpenAI(api_key=openai_api_key)
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": VISION_LAYOUT_PROMPT},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}", "detail": "high"}},
-            ],
-        }
-    ]
-    resp = await client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        temperature=0.1,
-        max_tokens=500,
-    )
-    text = resp.choices[0].message.content.strip()
-    data = _parse_vision_json(text)
-    identity = data.get("extracted_identity") or {}
-    data["extracted_identity"] = _normalize_identity(identity)
-    data["layout"] = (data.get("layout") or "single").lower()
-    data["regions"] = data.get("regions") or []
-    return data
+    del openai_api_key
+    return await _classify_page_with_google_ocr(image_base64)
 
 
 def extract_pages_as_pdf_bytes(pdf_bytes: bytes, page_indices: list[int]) -> bytes:
@@ -1093,7 +1197,7 @@ async def run_split_and_categorize(
     use_textract: Optional[bool] = None,
 ) -> dict[str, Any]:
     """
-    Dual OCR + Vision fallback. Detect engine once (Textract probe); never fail due to Textract.
+    OCR-first split and categorize using Google Vision text extraction and deterministic rules.
     Returns { success, engine_used, documents[] } with doc_type, pages, split_strategy, confidence, identity, pdf_base64, needs_review.
     """
     if is_pdf:
@@ -1103,13 +1207,8 @@ async def run_split_and_categorize(
         pages = image_to_page_images(file_content)
         pdf_bytes = None
 
-    aws_region = os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
     documents: list[dict[str, Any]] = []
-
-    engine_used = "vision_only"
-    if pages and aws_configured() and detect_engine is not None and (use_textract is None or use_textract):
-        first_img = pages[0][1]
-        engine_used = detect_engine(first_img, region=aws_region)
+    engine_used = "google_vision_ocr" if GOOGLE_VISION_ENABLED else "ocr_unavailable"
 
     # Smart-skip state: track previous page features, category and confidence
     prev_features: dict = {}
@@ -1148,15 +1247,9 @@ async def run_split_and_categorize(
             prev_features = curr_features
         elif is_pdf:
             prev_features = _extract_page_text_features(file_content, page_idx)
-        # ── Full classification ────────────────────────────────────────────
-        if engine_used == "textract+vision":
-            await _process_page_textract_vision(
-                page_idx, img_bytes, pdf_bytes, is_pdf, aws_region, openai_api_key, documents
-            )
-        else:
-            await _process_page_vision_only(
-                page_idx, img_bytes, pdf_bytes, is_pdf, openai_api_key, documents
-            )
+        await _process_page_vision_only(
+            page_idx, img_bytes, pdf_bytes, is_pdf, openai_api_key, documents
+        )
 
         # Update skip-state from the document just appended
         if documents:
