@@ -1,26 +1,54 @@
 """
 Enhanced Photo Extraction Module
-Extracts embedded images from PDFs and converts to JPEG
-Version: 2.1.0
+Extracts embedded images from PDFs and provides reusable crop and normalize helpers.
+Version: 2.2.0
 """
 
+from dataclasses import dataclass
 import io
 import logging
+from typing import Optional
+
 import fitz  # PyMuPDF
 from PIL import Image
 
 logger = logging.getLogger(__name__)
 
 
-def extract_embedded_images_from_pdf_page(pdf_bytes: bytes, page_num: int) -> list[bytes]:
+@dataclass
+class PhotoCandidate:
+    source: str
+    page_num: int
+    image_bytes: bytes
+    width: int
+    height: int
+    image_index: Optional[int] = None
+
+
+def _image_bytes_to_jpeg(image_bytes: bytes) -> tuple[bytes, int, int]:
+    pil_image = Image.open(io.BytesIO(image_bytes))
+
+    if pil_image.mode == 'RGBA':
+        rgb_image = Image.new('RGB', pil_image.size, (255, 255, 255))
+        rgb_image.paste(pil_image, mask=pil_image.split()[3])
+        pil_image = rgb_image
+    elif pil_image.mode != 'RGB':
+        pil_image = pil_image.convert('RGB')
+
+    jpeg_buffer = io.BytesIO()
+    pil_image.save(jpeg_buffer, format='JPEG', quality=95, optimize=True)
+    return jpeg_buffer.getvalue(), pil_image.width, pil_image.height
+
+
+def extract_embedded_image_candidates_from_pdf_page(pdf_bytes: bytes, page_num: int) -> list[PhotoCandidate]:
     """
     Extract all embedded images from a specific PDF page.
-    Returns list of JPEG bytes for each image found.
+    Returns image candidates with normalized JPEG bytes and dimensions.
     
     This is the PROPER way to extract photos from PDFs - extract the embedded
     images directly, not convert the entire page to an image.
     """
-    images_found = []
+    images_found: list[PhotoCandidate] = []
     
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -39,34 +67,23 @@ def extract_embedded_images_from_pdf_page(pdf_bytes: bytes, page_num: int) -> li
                 base_image = doc.extract_image(xref)
                 image_bytes = base_image["image"]
                 image_ext = base_image["ext"]  # Original format (png, jpg, etc.)
+                img_w = int(base_image.get("width", 0) or 0)
+                img_h = int(base_image.get("height", 0) or 0)
                 
                 logger.info(f"[PhotoExtract] Image {img_index + 1}: format={image_ext}, size={len(image_bytes)} bytes")
-                
-                # Convert to JPEG if not already
-                if image_ext.lower() in ['jpg', 'jpeg']:
-                    # Already JPEG, use as-is
-                    jpeg_bytes = image_bytes
-                else:
-                    # Convert to JPEG
-                    pil_image = Image.open(io.BytesIO(image_bytes))
-                    
-                    # Convert RGBA to RGB if needed
-                    if pil_image.mode == 'RGBA':
-                        # Create white background
-                        rgb_image = Image.new('RGB', pil_image.size, (255, 255, 255))
-                        rgb_image.paste(pil_image, mask=pil_image.split()[3])  # Use alpha channel as mask
-                        pil_image = rgb_image
-                    elif pil_image.mode != 'RGB':
-                        pil_image = pil_image.convert('RGB')
-                    
-                    # Save as JPEG
-                    jpeg_buffer = io.BytesIO()
-                    pil_image.save(jpeg_buffer, format='JPEG', quality=95, optimize=True)
-                    jpeg_bytes = jpeg_buffer.getvalue()
-                    
+                jpeg_bytes, converted_w, converted_h = _image_bytes_to_jpeg(image_bytes)
+
+                if image_ext.lower() not in ['jpg', 'jpeg']:
                     logger.info(f"[PhotoExtract] Converted {image_ext} to JPEG: {len(jpeg_bytes)} bytes")
-                
-                images_found.append(jpeg_bytes)
+
+                images_found.append(PhotoCandidate(
+                    source='embedded',
+                    page_num=page_num,
+                    image_bytes=jpeg_bytes,
+                    width=img_w or converted_w,
+                    height=img_h or converted_h,
+                    image_index=img_index,
+                ))
                 
             except Exception as e:
                 logger.error(f"[PhotoExtract] Failed to extract image {img_index + 1}: {e}")
@@ -80,17 +97,21 @@ def extract_embedded_images_from_pdf_page(pdf_bytes: bytes, page_num: int) -> li
     return images_found
 
 
-def convert_pdf_page_to_jpeg(pdf_bytes: bytes, page_num: int) -> bytes:
+def extract_embedded_images_from_pdf_page(pdf_bytes: bytes, page_num: int) -> list[bytes]:
+    """Backward-compatible wrapper that returns only JPEG bytes."""
+    return [candidate.image_bytes for candidate in extract_embedded_image_candidates_from_pdf_page(pdf_bytes, page_num)]
+
+
+def render_pdf_page_to_jpeg(pdf_bytes: bytes, page_num: int, scale: float = 2.0) -> bytes:
     """
-    Fallback: Convert entire PDF page to JPEG image.
-    Use this when no embedded images are found (rare for photos).
+    Render a PDF page to a JPEG image for fallback face detection.
     """
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         page = doc[page_num]
         
         # Render page at high DPI for quality
-        mat = fitz.Matrix(2.0, 2.0)  # 2x scale = 144 DPI
+        mat = fitz.Matrix(scale, scale)
         pix = page.get_pixmap(matrix=mat)
         
         logger.info(f"[PhotoExtract] Rendered page {page_num} as pixmap: {pix.width}x{pix.height}px")
@@ -118,6 +139,56 @@ def convert_pdf_page_to_jpeg(pdf_bytes: bytes, page_num: int) -> bytes:
     except Exception as e:
         logger.error(f"[PhotoExtract] Failed to convert page {page_num} to JPEG: {e}")
         raise
+
+
+def convert_pdf_page_to_jpeg(pdf_bytes: bytes, page_num: int) -> bytes:
+    """Backward-compatible wrapper."""
+    return render_pdf_page_to_jpeg(pdf_bytes, page_num, scale=2.0)
+
+
+def crop_image_with_padding(
+    image_bytes: bytes,
+    left: int,
+    top: int,
+    right: int,
+    bottom: int,
+    padding_ratio: float = 0.30,
+) -> Image.Image:
+    """Crop an image box with padding and normalize to RGB."""
+    pil_image = Image.open(io.BytesIO(image_bytes))
+    if pil_image.mode != 'RGB':
+        pil_image = pil_image.convert('RGB')
+
+    width, height = pil_image.size
+    face_w = max(1, right - left)
+    face_h = max(1, bottom - top)
+    padding = int(max(face_w, face_h) * padding_ratio)
+
+    x1 = max(0, left - padding)
+    y1 = max(0, top - padding)
+    x2 = min(width, right + padding)
+    y2 = min(height, bottom + padding)
+    return pil_image.crop((x1, y1, x2, y2))
+
+
+def normalize_face_crop_to_jpeg(face_crop: Image.Image, target_size: int = 512) -> bytes:
+    """Convert a face crop into a square JPEG."""
+    if face_crop.mode != 'RGB':
+        face_crop = face_crop.convert('RGB')
+
+    crop_w, crop_h = face_crop.size
+    if crop_w != crop_h:
+        max_dim = max(crop_w, crop_h)
+        square_img = Image.new('RGB', (max_dim, max_dim), (255, 255, 255))
+        x_offset = (max_dim - crop_w) // 2
+        y_offset = (max_dim - crop_h) // 2
+        square_img.paste(face_crop, (x_offset, y_offset))
+        face_crop = square_img
+
+    face_crop = face_crop.resize((target_size, target_size), Image.Resampling.LANCZOS)
+    jpeg_buffer = io.BytesIO()
+    face_crop.save(jpeg_buffer, format='JPEG', quality=95, optimize=True)
+    return jpeg_buffer.getvalue()
 
 
 def extract_photo_from_pdf(pdf_bytes: bytes, page_num: int = 0) -> bytes:

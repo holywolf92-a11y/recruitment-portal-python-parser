@@ -43,6 +43,12 @@ import numpy as np  # For image arrays
 from scipy import ndimage  # For image processing
 from scipy.ndimage import gaussian_filter
 from enhance_nationality import enhance_nationality_with_ai
+from extract_photos_v2 import (
+    extract_embedded_image_candidates_from_pdf_page,
+    render_pdf_page_to_jpeg,
+    crop_image_with_padding,
+    normalize_face_crop_to_jpeg,
+)
 
 # cv2 is not needed - using PIL + scipy instead
 CV2_AVAILABLE = True  # We can do face detection with PIL + scipy
@@ -1398,7 +1404,7 @@ async def parse_cv_from_url(
                 text_content = extract_text_from_pdf(file_content)
                 
                 # PHASE C COMPLETE: Real ML-based face detection enabled!
-                profile_photo_url = extract_profile_photo_from_pdf(file_content, attachment_id or "unknown")
+                profile_photo_url = await extract_profile_photo_from_pdf(file_content, attachment_id or "unknown")
                 
                 # Parse with OpenAI (fallback to Vision when text extraction is weak)
                 if len(text_content.strip()) < 200:
@@ -1433,7 +1439,7 @@ async def parse_cv_from_url(
         # Strategy 2: If it's an image, use Google Vision OCR and then parse the extracted text.
         elif file_type in ['jpeg', 'png', 'gif', 'webp', 'bmp']:
             logger.info(f"[CVParse] Image file detected ({file_type}).")
-            profile_photo_url = extract_profile_photo_from_image(file_content, attachment_id or "unknown")
+            profile_photo_url = await extract_profile_photo_from_image(file_content, attachment_id or "unknown")
             
             if GOOGLE_VISION_ENABLED:
                 # Use Google Vision OCR (cheap, ~$1.50/1000 pages)
@@ -1727,25 +1733,18 @@ Extract this information even if labels are slightly different."""
             "raw_text": None,
         }
 
-async def _google_vision_ocr_image_bytes(image_bytes: bytes) -> str:
-    """
-    Call Google Cloud Vision DOCUMENT_TEXT_DETECTION on a single in-memory image.
-    Authenticates using service account JSON (GOOGLE_APPLICATION_CREDENTIALS_JSON env var)
-    or falls back to API key (GOOGLE_VISION_API_KEY env var).
-    """
+async def _google_vision_annotate_image_bytes(image_bytes: bytes, features: list[dict]) -> dict:
+    """Call Google Cloud Vision annotate on a single in-memory image."""
     if not GOOGLE_VISION_ENABLED:
-        return ""
+        return {}
     try:
-        import base64, json, httpx
-
         payload = {
             "requests": [{
                 "image": {"content": base64.b64encode(image_bytes).decode("utf-8")},
-                "features": [{"type": "DOCUMENT_TEXT_DETECTION"}]
+                "features": features,
             }]
         }
 
-        # Prefer service account JSON auth (OAuth2 Bearer token)
         if GOOGLE_APPLICATION_CREDENTIALS_JSON:
             import google.oauth2.service_account as sa
             import google.auth.transport.requests as ga_requests
@@ -1753,7 +1752,6 @@ async def _google_vision_ocr_image_bytes(image_bytes: bytes) -> str:
                 json.loads(GOOGLE_APPLICATION_CREDENTIALS_JSON),
                 scopes=["https://www.googleapis.com/auth/cloud-vision"]
             )
-            # Refresh token synchronously (fast — just a JWT exchange)
             creds.refresh(ga_requests.Request())
             url = "https://vision.googleapis.com/v1/images:annotate"
             headers = {
@@ -1761,7 +1759,6 @@ async def _google_vision_ocr_image_bytes(image_bytes: bytes) -> str:
                 "Authorization": f"Bearer {creds.token}"
             }
         else:
-            # Fallback: plain API key
             url = f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_API_KEY}"
             headers = {"Content-Type": "application/json"}
 
@@ -1770,14 +1767,31 @@ async def _google_vision_ocr_image_bytes(image_bytes: bytes) -> str:
 
         if resp.status_code != 200:
             logger.warning(f"[GoogleVision] HTTP {resp.status_code}: {resp.text[:200]}")
-            return ""
-        data = resp.json()
-        return (data.get("responses", [{}])[0]
-                    .get("fullTextAnnotation", {})
-                    .get("text", ""))
+            return {}
+        return resp.json().get("responses", [{}])[0]
     except Exception as e:
-        logger.warning(f"[GoogleVision] OCR call failed: {e}")
-        return ""
+        logger.warning(f"[GoogleVision] annotate call failed: {e}")
+        return {}
+
+async def _google_vision_ocr_image_bytes(image_bytes: bytes) -> str:
+    """
+    Call Google Cloud Vision DOCUMENT_TEXT_DETECTION on a single in-memory image.
+    Authenticates using service account JSON (GOOGLE_APPLICATION_CREDENTIALS_JSON env var)
+    or falls back to API key (GOOGLE_VISION_API_KEY env var).
+    """
+    data = await _google_vision_annotate_image_bytes(
+        image_bytes,
+        [{"type": "DOCUMENT_TEXT_DETECTION"}],
+    )
+    return data.get("fullTextAnnotation", {}).get("text", "") if data else ""
+
+async def _google_vision_face_detect_image_bytes(image_bytes: bytes) -> list[dict]:
+    """Detect faces on a single in-memory image using Google Vision FACE_DETECTION."""
+    data = await _google_vision_annotate_image_bytes(
+        image_bytes,
+        [{"type": "FACE_DETECTION", "maxResults": 5}],
+    )
+    return data.get("faceAnnotations", []) if data else []
 
 async def extract_text_from_scanned_pdf_google_vision(pdf_content: bytes, max_pages: int = 3) -> str:
     """
@@ -1935,6 +1949,111 @@ def is_image_too_dark_or_bright(image: Image.Image, dark_threshold: int = 30, br
         logger.warning(f"[QUALITY_CHECK] brightness_check failed: {e}")
         return False, "UNKNOWN"
 
+
+def _extract_face_bounds(face: dict, image_width: int, image_height: int) -> Optional[tuple[int, int, int, int, float]]:
+    poly = face.get("fdBoundingPoly") or face.get("boundingPoly") or {}
+    vertices = poly.get("vertices") or []
+    if not vertices:
+        return None
+
+    xs = [max(0, min(image_width, int(vertex.get("x", 0) or 0))) for vertex in vertices]
+    ys = [max(0, min(image_height, int(vertex.get("y", 0) or 0))) for vertex in vertices]
+    left = min(xs)
+    right = max(xs)
+    top = min(ys)
+    bottom = max(ys)
+
+    if right <= left or bottom <= top:
+        return None
+
+    area_ratio = ((right - left) * (bottom - top)) / max(1, image_width * image_height)
+    return left, top, right, bottom, area_ratio
+
+
+def _normalize_angle(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _face_angles_are_acceptable(face: dict) -> bool:
+    pan = abs(_normalize_angle(face.get("panAngle")))
+    roll = abs(_normalize_angle(face.get("rollAngle")))
+    tilt = abs(_normalize_angle(face.get("tiltAngle")))
+    return pan <= 40 and roll <= 35 and tilt <= 25
+
+
+def _portrait_score(width: int, height: int) -> float:
+    aspect = width / max(1, height)
+    return max(0.0, 1.0 - min(1.0, abs(aspect - 1.0) / 0.75))
+
+
+def _evaluate_face_crop(image_bytes: bytes, face: dict, source: str, label: str) -> Optional[dict]:
+    try:
+        pil_img = Image.open(io.BytesIO(image_bytes))
+        if pil_img.mode != 'RGB':
+            pil_img = pil_img.convert('RGB')
+        image_width, image_height = pil_img.size
+
+        bounds = _extract_face_bounds(face, image_width, image_height)
+        if not bounds:
+            return None
+
+        left, top, right, bottom, area_ratio = bounds
+        detection_confidence = float(face.get("detectionConfidence") or 0.0)
+        if detection_confidence < 0.65:
+            return None
+        if not _face_angles_are_acceptable(face):
+            return None
+
+        if source == 'embedded':
+            if area_ratio < 0.08 or area_ratio > 0.85:
+                return None
+        else:
+            if area_ratio < 0.01 or area_ratio > 0.20:
+                return None
+
+        face_crop = crop_image_with_padding(image_bytes, left, top, right, bottom, padding_ratio=0.30)
+        if face_crop.width < 96 or face_crop.height < 96:
+            return None
+        if is_image_blurry(face_crop, threshold=100):
+            return None
+
+        is_bad_brightness, brightness_reason = is_image_too_dark_or_bright(face_crop)
+        if is_bad_brightness:
+            logger.info(f"[PHOTO_EXTRACT] label={label} action=REJECT reason={brightness_reason}")
+            return None
+
+        size_score = min(1.0, max(face_crop.width, face_crop.height) / 512.0)
+        portrait_score = _portrait_score(face_crop.width, face_crop.height)
+        score = (detection_confidence * 0.65) + (size_score * 0.20) + (portrait_score * 0.15)
+
+        return {
+            "score": score,
+            "crop": face_crop,
+            "confidence": detection_confidence,
+            "area_ratio": area_ratio,
+            "label": label,
+        }
+    except Exception as exc:
+        logger.warning(f"[PHOTO_EXTRACT] label={label} action=REJECT reason=EVAL_ERROR error={exc}")
+        return None
+
+
+async def _select_best_face_crop(image_bytes: bytes, source: str, label: str) -> Optional[dict]:
+    faces = await _google_vision_face_detect_image_bytes(image_bytes)
+    if not faces:
+        logger.info(f"[PHOTO_EXTRACT] label={label} action=SKIP reason=NO_FACES_DETECTED")
+        return None
+
+    best = None
+    for face in faces:
+        candidate = _evaluate_face_crop(image_bytes, face, source, label)
+        if candidate and (best is None or candidate["score"] > best["score"]):
+            best = candidate
+    return best
+
 def detect_photo_region_heuristic(image: Image.Image) -> Optional[tuple]:
     """
     Heuristic: Find likely photo region on document page using simple brightness analysis.
@@ -2071,110 +2190,24 @@ def detect_faces_with_mediapipe(image: Image.Image) -> list:
         logger.warning(f"[FACE_DETECT] Face detection failed: {e}")
         return []
 
-def extract_profile_photo_from_image(image_content: bytes, attachment_id: str) -> Optional[str]:
+async def extract_profile_photo_from_image(image_content: bytes, attachment_id: str) -> Optional[str]:
     """
-    Extract profile photo from image file (JPEG, PNG, etc.) using face-recognition ML library.
-    
-    Pipeline:
-    1. Load image directly (no PDF rendering needed)
-    2. Detect faces using face-recognition (dlib HOG)
-    3. Quality checks (blur, brightness, size)
-    4. Smart cropping and upload
-    
+    Extract profile photo from image file (JPEG, PNG, etc.) using Google Vision face detection.
+
     Returns the signed URL of the uploaded photo, or None if no photo found.
     """
     try:
-        import cv2
-        
         logger.info(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} action=START")
-        
-        # Step 1: Load image directly
-        pil_img = Image.open(io.BytesIO(image_content))
-        
-        # Convert to RGB if needed (PNG might have alpha channel)
-        if pil_img.mode != 'RGB':
-            pil_img = pil_img.convert('RGB')
-        
-        w, h = pil_img.size
-        logger.info(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} image_loaded dims={w}x{h}")
-        
-        # Step 2: Detect faces with OpenCV Haar Cascade (no compilation required)
-        img_array = np.array(pil_img)
-        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        raw_faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
-        # Convert (x, y, w, h) → (top, right, bottom, left)
-        face_locations = [(y, x + fw, y + fh, x) for (x, y, fw, fh) in (raw_faces if len(raw_faces) > 0 else [])]
-        
-        if not face_locations:
-            logger.info(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} action=SKIP reason=NO_FACES_DETECTED")
+        if not GOOGLE_VISION_ENABLED:
+            logger.info(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} action=SKIP reason=GOOGLE_VISION_DISABLED")
             return None
-        
-        logger.info(f"[FACE_DETECT] Found {len(face_locations)} face(s) using ML on image")
-        
-        # Sort by area desc to prefer the main headshot
-        def _area(loc):
-            t, r, b, l = loc
-            return max(0, (r - l)) * max(0, (b - t))
-        
-        face_locations.sort(key=_area, reverse=True)
-        
-        best_face_crop = None
-        best_face_area = 0
-        
-        for loc in face_locations[:3]:
-            top, right, bottom, left = loc
-            face_width = right - left
-            face_height = bottom - top
-            face_area = max(0, face_width) * max(0, face_height)
-            
-            # Step 3: Quality checks
-            if face_width < 50 or face_height < 50:
-                continue
-            
-            padding = int(max(face_width, face_height) * 0.20)
-            x1 = max(0, left - padding)
-            y1 = max(0, top - padding)
-            x2 = min(w, right + padding)
-            y2 = min(h, bottom + padding)
-            
-            face_crop = pil_img.crop((x1, y1, x2, y2))
-            
-            if is_image_blurry(face_crop, threshold=100):
-                continue
-            
-            is_bad_brightness, brightness_reason = is_image_too_dark_or_bright(face_crop)
-            if is_bad_brightness:
-                continue
-            
-            if face_area > best_face_area:
-                best_face_area = face_area
-                best_face_crop = face_crop
-        
-        if best_face_crop is None:
-            logger.info(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} action=SKIP reason=NO_QUALITY_FACES")
+
+        best = await _select_best_face_crop(image_content, 'image', f"candidate_id={attachment_id} source=image")
+        if not best:
             return None
-        
-        # Step 4: Standardize to square 512x512
-        target_size = 512
-        crop_w, crop_h = best_face_crop.size
-        
-        face_crop = best_face_crop
-        if crop_w != crop_h:
-            max_dim = max(crop_w, crop_h)
-            square_img = Image.new('RGB', (max_dim, max_dim), (255, 255, 255))
-            x_offset = (max_dim - crop_w) // 2
-            y_offset = (max_dim - crop_h) // 2
-            square_img.paste(face_crop, (x_offset, y_offset))
-            face_crop = square_img
-        
-        face_crop = face_crop.resize((target_size, target_size), Image.Resampling.LANCZOS)
-        logger.info(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} face_ready size={target_size}x{target_size}")
-        
-        # Step 5: Convert to JPEG and upload
-        buffer = io.BytesIO()
-        face_crop.save(buffer, format='JPEG', quality=95)
-        photo_bytes = buffer.getvalue()
+
+        photo_bytes = normalize_face_crop_to_jpeg(best['crop'])
+        logger.info(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} face_ready score={best['score']:.2f}")
         
         # Upload to Supabase (will return signed URL)
         photo_url = upload_photo_to_supabase(photo_bytes, attachment_id, "jpg")
@@ -2186,10 +2219,6 @@ def extract_profile_photo_from_image(image_content: bytes, attachment_id: str) -
         
         return photo_url
         
-    except ImportError as e:
-        logger.warning(f"[PHOTO_EXTRACT_IMG] opencv-python-headless library not available: {e}")
-        return None
-        
     except Exception as e:
         logger.warning(f"[PHOTO_EXTRACT_IMG] candidate_id={attachment_id} extraction_failed error={e}")
         import traceback
@@ -2197,171 +2226,60 @@ def extract_profile_photo_from_image(image_content: bytes, attachment_id: str) -
         return None  # Graceful fallback
 
 
-def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str, max_pages: int = 5) -> Optional[str]:
+async def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str, max_pages: int = 5) -> Optional[str]:
     """
-    Extract profile photo from PDF using face-recognition ML library (Phase C).
-    
-    Pipeline:
-    1. Render PDF first page to image
-    2. Detect faces using face-recognition (dlib HOG)
-    3. Quality checks (blur, brightness, size)
-    4. Smart cropping and upload
-    
+    Extract profile photo from PDF using Google Vision face detection.
+
     Returns the signed URL of the uploaded photo, or None if no photo found.
     """
     try:
-        import cv2
-        
         logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=START")
-        
-        # Step 1: Render PDF pages to images (scan first N pages)
+        if not GOOGLE_VISION_ENABLED:
+            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=GOOGLE_VISION_DISABLED")
+            return None
+
         pdf_document = fitz.open(stream=pdf_content, filetype="pdf")
         if pdf_document.page_count == 0:
             logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=NO_PAGES")
             return None
 
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        best_face_crop = None
-        best_face_area = 0
-
         pages_to_scan = min(max_pages, pdf_document.page_count)
-        for page_index in range(pages_to_scan):
-            page = pdf_document[page_index]
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom for better detection
-            img_data = pix.tobytes("png")
-            pil_img = Image.open(io.BytesIO(img_data))
-
-            w, h = pil_img.size
-            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} page_rendered page={page_index+1} dims={w}x{h}")
-
-            # Step 2: Detect faces with OpenCV Haar Cascade (no compilation required)
-            img_array = np.array(pil_img)
-            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-            raw_faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
-            # Convert (x, y, w, h) → (top, right, bottom, left)
-            face_locations = [(y, x + fw, y + fh, x) for (x, y, fw, fh) in (raw_faces if len(raw_faces) > 0 else [])]
-
-            if not face_locations:
-                continue
-
-            logger.info(f"[FACE_DETECT] Found {len(face_locations)} face(s) using ML on page={page_index+1}")
-
-            # Sort by area desc to prefer the main headshot
-            def _area(loc):
-                t, r, b, l = loc
-                return max(0, (r - l)) * max(0, (b - t))
-
-            face_locations.sort(key=_area, reverse=True)
-
-            for loc in face_locations[:3]:
-                top, right, bottom, left = loc
-                face_width = right - left
-                face_height = bottom - top
-                face_area = max(0, face_width) * max(0, face_height)
-
-                # Step 3: Quality checks
-                if face_width < 50 or face_height < 50:
-                    continue
-
-                padding = int(max(face_width, face_height) * 0.20)
-                x1 = max(0, left - padding)
-                y1 = max(0, top - padding)
-                x2 = min(w, right + padding)
-                y2 = min(h, bottom + padding)
-
-                face_crop = pil_img.crop((x1, y1, x2, y2))
-
-                if is_image_blurry(face_crop, threshold=100):
-                    continue
-
-                is_bad_brightness, brightness_reason = is_image_too_dark_or_bright(face_crop)
-                if is_bad_brightness:
-                    continue
-
-                if face_area > best_face_area:
-                    best_face_area = face_area
-                    best_face_crop = face_crop
-
-            # If we found a decent face on this page, keep scanning remaining pages
-            # in case there's a larger/clearer one.
-
         pdf_document.close()
 
-        if best_face_crop is None:
-            # Fallback: Haar Cascade missed the face (turned head, partial occlusion, etc.)
-            # Try extracting discrete embedded image objects from the PDF via PyMuPDF.
-            # Most CV templates embed the headshot as a real image object — this is
-            # format-independent and doesn't require face detection.
-            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=FALLBACK reason=NO_FACES_DETECTED trying embedded images")
-            try:
-                doc2 = fitz.open(stream=pdf_content, filetype="pdf")
-                candidate_images = []
-                pages_to_check = min(max_pages, doc2.page_count)
-                for page_idx in range(pages_to_check):
-                    page = doc2[page_idx]
-                    for img_info in page.get_images(full=True):
-                        xref = img_info[0]
-                        try:
-                            base_image = doc2.extract_image(xref)
-                            img_bytes = base_image["image"]
-                            img_w = base_image.get("width", 0)
-                            img_h = base_image.get("height", 0)
-                            # Skip icons/logos (too small) and full-page backgrounds (too large)
-                            if img_w < 80 or img_h < 80:
-                                continue
-                            if img_w > 2000 or img_h > 2000:
-                                continue
-                            # Only accept portrait or square aspect ratios (typical headshots)
-                            aspect = img_h / img_w if img_w > 0 else 0
-                            if aspect < 0.5 or aspect > 2.5:
-                                continue
-                            candidate_images.append((img_w * img_h, img_bytes))
-                            logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} embedded_image page={page_idx+1} size={img_w}x{img_h} aspect={aspect:.2f}")
-                        except Exception:
-                            continue
-                doc2.close()
+        best = None
+        for page_index in range(pages_to_scan):
+            embedded_candidates = extract_embedded_image_candidates_from_pdf_page(pdf_content, page_index)
+            for embedded in embedded_candidates:
+                if embedded.width < 80 or embedded.height < 80:
+                    continue
+                if embedded.width > 3000 or embedded.height > 3000:
+                    continue
 
-                if candidate_images:
-                    # Pick the largest qualifying image — most likely the profile photo
-                    candidate_images.sort(key=lambda x: x[0], reverse=True)
-                    _, best_img_bytes = candidate_images[0]
-                    pil_img = Image.open(io.BytesIO(best_img_bytes))
-                    if pil_img.mode != 'RGB':
-                        pil_img = pil_img.convert('RGB')
-                    pil_img = pil_img.resize((512, 512), Image.Resampling.LANCZOS)
-                    buf = io.BytesIO()
-                    pil_img.save(buf, format='JPEG', quality=95)
-                    photo_bytes = buf.getvalue()
-                    photo_url = upload_photo_to_supabase(photo_bytes, attachment_id, "jpg")
-                    if photo_url:
-                        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} SUCCESS_FALLBACK uploaded_as={photo_url}")
-                        return photo_url
-            except Exception as fallback_err:
-                logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} fallback_error={fallback_err}")
+                label = f"candidate_id={attachment_id} source=embedded page={page_index + 1} image={embedded.image_index}"
+                candidate = await _select_best_face_crop(embedded.image_bytes, 'embedded', label)
+                if candidate and (best is None or candidate['score'] > best['score']):
+                    best = candidate
+                    if candidate['score'] >= 0.88:
+                        break
+            if best and best['score'] >= 0.88:
+                break
 
+        if not best:
+            for page_index in range(pages_to_scan):
+                rendered_jpeg = render_pdf_page_to_jpeg(pdf_content, page_index, scale=2.0)
+                label = f"candidate_id={attachment_id} source=rendered page={page_index + 1}"
+                candidate = await _select_best_face_crop(rendered_jpeg, 'rendered_page', label)
+                if candidate and (best is None or candidate['score'] > best['score']):
+                    best = candidate
+                    if candidate['score'] >= 0.88:
+                        break
+
+        if best is None or best['score'] < 0.72:
             logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=NO_PHOTO_FOUND")
             return None
 
-        # Step 4: Standardize to square 512x512
-        target_size = 512
-        crop_w, crop_h = best_face_crop.size
-
-        face_crop = best_face_crop
-        if crop_w != crop_h:
-            max_dim = max(crop_w, crop_h)
-            square_img = Image.new('RGB', (max_dim, max_dim), (255, 255, 255))
-            x_offset = (max_dim - crop_w) // 2
-            y_offset = (max_dim - crop_h) // 2
-            square_img.paste(face_crop, (x_offset, y_offset))
-            face_crop = square_img
-
-        face_crop = face_crop.resize((target_size, target_size), Image.Resampling.LANCZOS)
-        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} face_ready size={target_size}x{target_size}")
-
-        # Step 5: Convert to JPEG and upload
-        buffer = io.BytesIO()
-        face_crop.save(buffer, format='JPEG', quality=95)
-        photo_bytes = buffer.getvalue()
+        photo_bytes = normalize_face_crop_to_jpeg(best['crop'])
+        logger.info(f"[PHOTO_EXTRACT] candidate_id={attachment_id} face_ready score={best['score']:.2f}")
         
         # Upload to Supabase (will return signed URL)
         photo_url = upload_photo_to_supabase(photo_bytes, attachment_id, "jpg")
@@ -2372,10 +2290,6 @@ def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str, max_p
             logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} action=SKIP reason=UPLOAD_FAILED")
         
         return photo_url
-        
-    except ImportError as e:
-        logger.warning(f"[PHOTO_EXTRACT] opencv-python-headless library not available: {e}")
-        return None
         
     except Exception as e:
         logger.warning(f"[PHOTO_EXTRACT] candidate_id={attachment_id} extraction_failed error={e}")
@@ -2401,7 +2315,7 @@ async def extract_photo(
 
     try:
         pdf_bytes = base64.b64decode(extract_request.file_content)
-        url = extract_profile_photo_from_pdf(pdf_bytes, extract_request.attachment_id)
+        url = await extract_profile_photo_from_pdf(pdf_bytes, extract_request.attachment_id)
         if not url:
             return ExtractPhotoResponse(success=True, profile_photo_url=None)
         return ExtractPhotoResponse(success=True, profile_photo_url=url)
