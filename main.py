@@ -45,6 +45,7 @@ from scipy.ndimage import gaussian_filter
 from enhance_nationality import enhance_nationality_with_ai
 from extract_photos_v2 import (
     extract_embedded_image_candidates_from_pdf_page,
+    extract_displayed_image_candidates_from_pdf_page,
     render_pdf_page_to_jpeg,
     crop_image_with_padding,
     normalize_face_crop_to_jpeg,
@@ -2056,6 +2057,152 @@ async def _select_best_face_crop(image_bytes: bytes, source: str, label: str) ->
             best = candidate
     return best
 
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _pil_image_to_jpeg_bytes(image: Image.Image) -> bytes:
+    buffer = io.BytesIO()
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+    image.save(buffer, format='JPEG', quality=95, optimize=True)
+    return buffer.getvalue()
+
+
+async def _select_avatar_from_wide_banner(image_bytes: bytes, label: str) -> Optional[dict]:
+    """
+    Some CV templates flatten the header into one wide banner image that contains
+    the circular avatar plus surrounding text/icons. Try to recover the avatar
+    region from that banner before giving up on direct image extraction.
+    """
+    try:
+        pil_img = Image.open(io.BytesIO(image_bytes))
+        if pil_img.mode != 'RGB':
+            pil_img = pil_img.convert('RGB')
+
+        image_w, image_h = pil_img.size
+        face_like_regions = detect_faces_with_mediapipe(pil_img)
+        if face_like_regions:
+            face_like_regions = sorted(face_like_regions, key=lambda item: item[4], reverse=True)
+            x, y, w, h, confidence = face_like_regions[0]
+        else:
+            photo_region = detect_photo_region_heuristic(pil_img)
+            if not photo_region:
+                return None
+            x, y, w, h, confidence = photo_region
+
+        crop = crop_image_with_padding(image_bytes, int(x), int(y), int(x + w), int(y + h), padding_ratio=0.22)
+        if crop.width < 96 or crop.height < 96:
+            return None
+        if is_image_blurry(crop, threshold=45):
+            return None
+
+        is_bad_brightness, _ = is_image_too_dark_or_bright(crop, dark_threshold=20, bright_threshold=245)
+        if is_bad_brightness:
+            return None
+
+        crop_bytes = _pil_image_to_jpeg_bytes(crop)
+        face_candidate = await _select_best_face_crop(crop_bytes, 'embedded', f"{label} derived_crop")
+        face_bonus = face_candidate['score'] if face_candidate else 0.0
+
+        aspect = crop.width / max(1, crop.height)
+        square_bias = 1.0 - _clamp01(abs(aspect - 1.0) / 0.40)
+        size_bias = min(1.0, max(crop.width, crop.height) / 320.0)
+        score = (confidence * 0.40) + (square_bias * 0.30) + (size_bias * 0.15) + (face_bonus * 0.15)
+
+        return {
+            'score': score,
+            'crop': crop,
+            'confidence': face_bonus,
+            'label': f"{label} derived_crop",
+            'square_bias': square_bias,
+            'top_bias': 1.0,
+        }
+    except Exception as exc:
+        logger.warning(f"[PHOTO_EXTRACT] label={label} action=REJECT reason=WIDE_BANNER_EVAL_ERROR error={exc}")
+        return None
+
+
+async def _select_best_displayed_avatar_candidate(candidates: list, label_prefix: str) -> Optional[dict]:
+    """
+    Score displayed image blocks using page placement and image geometry first,
+    then add any face-detection confidence as a bonus instead of requiring it.
+    """
+    best = None
+
+    for candidate in candidates:
+        if candidate.width < 80 or candidate.height < 80:
+            continue
+        if candidate.width > 3000 or candidate.height > 3000:
+            continue
+        if not candidate.bbox or not candidate.page_width or not candidate.page_height:
+            continue
+
+        x0, y0, x1, y1 = candidate.bbox
+        bbox_w = max(1.0, float(x1) - float(x0))
+        bbox_h = max(1.0, float(y1) - float(y0))
+        page_area_ratio = (bbox_w * bbox_h) / max(1.0, candidate.page_width * candidate.page_height)
+        if page_area_ratio < 0.005 or page_area_ratio > 0.18:
+            continue
+
+        aspect = candidate.width / max(1, candidate.height)
+        if aspect < 0.65:
+            continue
+
+        is_wide_banner = aspect > 1.35 and (float(y0) / candidate.page_height) < 0.20 and page_area_ratio >= 0.08
+        if aspect > 1.35 and not is_wide_banner:
+            continue
+
+        if is_wide_banner:
+            banner_candidate = await _select_avatar_from_wide_banner(
+                candidate.image_bytes,
+                f"{label_prefix} block={candidate.image_index}"
+            )
+            if banner_candidate and (best is None or banner_candidate['score'] > best['score']):
+                best = banner_candidate
+            continue
+
+        top_bias = 1.0 - _clamp01((float(y0) / candidate.page_height) / 0.40)
+        square_bias = 1.0 - _clamp01(abs(aspect - 1.0) / 0.35)
+        size_bias = 1.0 - _clamp01(abs(page_area_ratio - 0.045) / 0.06)
+
+        pil_img = Image.open(io.BytesIO(candidate.image_bytes))
+        if pil_img.mode != 'RGB':
+            pil_img = pil_img.convert('RGB')
+
+        if is_image_blurry(pil_img, threshold=55):
+            logger.info(f"[PHOTO_EXTRACT] label={label_prefix} block={candidate.image_index} action=REJECT reason=BLURRY_DISPLAYED_IMAGE")
+            continue
+
+        is_bad_brightness, brightness_reason = is_image_too_dark_or_bright(pil_img, dark_threshold=20, bright_threshold=245)
+        if is_bad_brightness:
+            logger.info(f"[PHOTO_EXTRACT] label={label_prefix} block={candidate.image_index} action=REJECT reason={brightness_reason}")
+            continue
+
+        face_candidate = await _select_best_face_crop(
+            candidate.image_bytes,
+            'embedded',
+            f"{label_prefix} block={candidate.image_index}"
+        )
+        face_bonus = face_candidate['score'] if face_candidate else 0.0
+
+        score = (top_bias * 0.38) + (square_bias * 0.27) + (size_bias * 0.20) + (face_bonus * 0.15)
+
+        evaluated = {
+            'score': score,
+            'crop': pil_img,
+            'confidence': face_bonus,
+            'label': f"{label_prefix} block={candidate.image_index}",
+            'page_area_ratio': page_area_ratio,
+            'top_bias': top_bias,
+            'square_bias': square_bias,
+        }
+        if best is None or evaluated['score'] > best['score']:
+            best = evaluated
+
+    return best
+
 def detect_photo_region_heuristic(image: Image.Image) -> Optional[tuple]:
     """
     Heuristic: Find likely photo region on document page using simple brightness analysis.
@@ -2250,6 +2397,14 @@ async def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str,
 
         best = None
         for page_index in range(pages_to_scan):
+            displayed_candidates = extract_displayed_image_candidates_from_pdf_page(pdf_content, page_index)
+            displayed_label = f"candidate_id={attachment_id} source=displayed_image_block page={page_index + 1}"
+            displayed_best = await _select_best_displayed_avatar_candidate(displayed_candidates, displayed_label)
+            if displayed_best and (best is None or displayed_best['score'] > best['score']):
+                best = displayed_best
+                if displayed_best['score'] >= 0.82:
+                    break
+
             embedded_candidates = extract_embedded_image_candidates_from_pdf_page(pdf_content, page_index)
             for embedded in embedded_candidates:
                 if embedded.width < 80 or embedded.height < 80:

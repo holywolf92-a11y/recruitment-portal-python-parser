@@ -23,6 +23,9 @@ class PhotoCandidate:
     width: int
     height: int
     image_index: Optional[int] = None
+    bbox: Optional[tuple[float, float, float, float]] = None
+    page_width: Optional[float] = None
+    page_height: Optional[float] = None
 
 
 def _image_bytes_to_jpeg(image_bytes: bytes) -> tuple[bytes, int, int]:
@@ -94,6 +97,57 @@ def extract_embedded_image_candidates_from_pdf_page(pdf_bytes: bytes, page_num: 
     except Exception as e:
         logger.error(f"[PhotoExtract] Failed to process PDF page {page_num}: {e}")
     
+    return images_found
+
+
+def extract_displayed_image_candidates_from_pdf_page(pdf_bytes: bytes, page_num: int) -> list[PhotoCandidate]:
+    """
+    Extract image blocks actually displayed on a page, including their page bbox.
+
+    This uses Page.get_text("dict") because it returns the rendered image blocks
+    with both binary image data and page coordinates. That makes it suitable for
+    ranking likely CV avatar/headshot images before falling back to full-page scans.
+    """
+    images_found: list[PhotoCandidate] = []
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page = doc[page_num]
+        page_dict = page.get_text("dict")
+        page_width = float(page.rect.width)
+        page_height = float(page.rect.height)
+
+        blocks = page_dict.get("blocks") or []
+        image_blocks = [block for block in blocks if block.get("type") == 1 and block.get("image")]
+        logger.info(f"[PhotoExtract] Found {len(image_blocks)} displayed image blocks on page {page_num}")
+
+        for img_index, block in enumerate(image_blocks):
+            try:
+                image_bytes = block["image"]
+                jpeg_bytes, converted_w, converted_h = _image_bytes_to_jpeg(image_bytes)
+                bbox = tuple(block.get("bbox") or ())
+                if len(bbox) != 4:
+                    bbox = None
+
+                images_found.append(PhotoCandidate(
+                    source='displayed_image_block',
+                    page_num=page_num,
+                    image_bytes=jpeg_bytes,
+                    width=int(block.get("width", 0) or converted_w),
+                    height=int(block.get("height", 0) or converted_h),
+                    image_index=img_index,
+                    bbox=bbox,
+                    page_width=page_width,
+                    page_height=page_height,
+                ))
+            except Exception as e:
+                logger.error(f"[PhotoExtract] Failed to process displayed image block {img_index + 1}: {e}")
+                continue
+
+        doc.close()
+    except Exception as e:
+        logger.error(f"[PhotoExtract] Failed to extract displayed image blocks from page {page_num}: {e}")
+
     return images_found
 
 
