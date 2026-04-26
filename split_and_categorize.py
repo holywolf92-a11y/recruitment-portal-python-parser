@@ -1247,6 +1247,7 @@ async def run_split_and_categorize(
     openai_api_key: str,
     candidate_data: Optional[dict] = None,
     use_textract: Optional[bool] = None,
+    exhaustive_page_scan: bool = False,
 ) -> dict[str, Any]:
     """
     OCR-first split and categorize using Google Vision text extraction and deterministic rules.
@@ -1262,7 +1263,9 @@ async def run_split_and_categorize(
     documents: list[dict[str, Any]] = []
     engine_used = "google_vision_ocr" if GOOGLE_VISION_ENABLED else "ocr_unavailable"
 
-    # Smart-skip state: track previous page features, category and confidence
+    # Smart-skip state: track previous page features, category and confidence.
+    # Exhaustive mode disables this optimization so mixed scanned bundles are
+    # always classified page-by-page before any grouping decisions are made.
     prev_features: dict = {}
     prev_category: str | None = None
     prev_confidence: float = 0.0
@@ -1271,7 +1274,7 @@ async def run_split_and_categorize(
         # ── Smart segment-skip check ───────────────────────────────────────
         # Only applies to PDFs (we need text features); never skips page 0;
         # never skips if prev confidence was low.
-        if is_pdf and page_idx > 0 and prev_category is not None:
+        if not exhaustive_page_scan and is_pdf and page_idx > 0 and prev_category is not None:
             curr_features = _extract_page_text_features(file_content, page_idx)
             should_reclassify = _should_reclassify(
                 prev_features, curr_features, prev_category, prev_confidence
@@ -1297,7 +1300,7 @@ async def run_split_and_categorize(
                 continue
             # Features differ → full classification below
             prev_features = curr_features
-        elif is_pdf:
+        elif not exhaustive_page_scan and is_pdf:
             prev_features = _extract_page_text_features(file_content, page_idx)
         await _process_page_vision_only(
             page_idx, img_bytes, pdf_bytes, is_pdf, openai_api_key, documents
@@ -1369,6 +1372,7 @@ async def run_split_and_categorize(
         logger.warning(f"[Split] CV page promotion heuristic failed: {e}")
 
     # Phase 2: group consecutive full-page units (same doc_type) -> one PDF per group, split_strategy "grouped"
-    documents = group_consecutive_pages(documents, pdf_bytes, is_pdf)
+    if not exhaustive_page_scan:
+        documents = group_consecutive_pages(documents, pdf_bytes, is_pdf)
 
     return {"success": True, "engine_used": engine_used, "documents": documents}

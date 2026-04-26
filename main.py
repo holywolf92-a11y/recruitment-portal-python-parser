@@ -156,6 +156,7 @@ class CategorizeRequest(BaseModel):
     mime_type: str
     candidate_data: Optional[Dict[str, Any]] = None
     use_textract: Optional[bool] = None  # True=use AWS Textract when configured; False=Vision-only; None=auto (use if AWS set)
+    exhaustive_page_scan: Optional[bool] = None
 
 class ParseResponse(BaseModel):
     success: bool
@@ -1260,6 +1261,7 @@ async def split_and_categorize(
             openai_api_key=OPENAI_API_KEY,
             candidate_data=categorize_request.candidate_data,
             use_textract=categorize_request.use_textract,
+            exhaustive_page_scan=bool(categorize_request.exhaustive_page_scan),
         )
         return result
     except HTTPException:
