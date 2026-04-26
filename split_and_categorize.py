@@ -477,6 +477,8 @@ def _classify_text_document(text: str) -> tuple[str, float]:
     cnic_score += 2 if "national identity card" in lower else 0
     cnic_score += 2 if has_cnic else 0
     cnic_score += sum(1 for kw in ["father name", "husband name", "identity number", "id card", "gender", "country of stay"] if kw in lower)
+    cnic_score += 3 if "registrar general of pakistan" in lower else 0
+    cnic_score += 2 if has_cnic and any(kw in lower for kw in ["father name", "identity number", "country of stay", "date of birth"]) else 0
 
     driving_score = 0
     driving_score += 3 if "driving license" in lower or "driving licence" in lower else 0
@@ -495,7 +497,18 @@ def _classify_text_document(text: str) -> tuple[str, float]:
 
     cv_score = 0
     cv_score += 4 if "curriculum vitae" in lower or "resume" in lower else 0
-    cv_score += sum(1 for kw in ["objective", "experience", "skills", "education", "references", "professional summary", "employment history"] if kw in lower)
+    cv_score += sum(1 for kw in [
+        "objective",
+        "experience",
+        "skills",
+        "skill",
+        "education",
+        "references",
+        "professional summary",
+        "employment history",
+        "contact info",
+        "profile",
+    ] if kw in lower)
 
     educational_score = 0
     educational_score += sum(2 for kw in ["transcript", "marksheet", "semester", "cgpa", "gpa", "board of", "roll no", "registration no"] if kw in lower)
@@ -505,10 +518,10 @@ def _classify_text_document(text: str) -> tuple[str, float]:
     certificate_score += 2 if "certificate" in lower else 0
     certificate_score += sum(1 for kw in ["training", "completion", "attendance", "course", "workshop", "seminar", "navttc", "experience certificate", "service certificate"] if kw in lower)
 
+    if cnic_score >= 4 and (cnic_score >= passport_score or (has_cnic and not has_mrz and not has_passport_no)):
+        return "cnic", 0.98
     if passport_score >= 4:
         return "passport", 0.97
-    if cnic_score >= 4:
-        return "cnic", 0.98
     if driving_score >= 4:
         return "driving_license", 0.95
     if police_score >= 4:
@@ -600,10 +613,11 @@ def pdf_to_page_images(pdf_bytes: bytes) -> list[tuple[int, bytes]]:
     result = []
     for i in range(len(doc)):
         page = doc[i]
-        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+        # Render scanned pages at a higher resolution and keep them lossless for OCR.
+        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
         img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85, optimize=True)
+        img.save(buf, format="PNG")
         result.append((i, buf.getvalue()))
     doc.close()
     return result
@@ -1314,62 +1328,64 @@ async def run_split_and_categorize(
 
     # Heuristic: if the upload is mostly a passport, treat nearby low-confidence other_documents pages
     # as passport too (common when users scan blank passport pages).
-    try:
-        page_docs = [d for d in documents if (d.get("split_strategy") or "page") == "page"]
-        passport_docs = [d for d in page_docs if d.get("doc_type") == "passport"]
-        if page_docs and passport_docs:
-            passport_ratio = len(passport_docs) / max(1, len(page_docs))
-            if passport_ratio >= 0.5:
-                passport_pages = set()
-                for d in passport_docs:
-                    for p in (d.get("pages") or []):
-                        passport_pages.add(int(p))
+    if not exhaustive_page_scan:
+        try:
+            page_docs = [d for d in documents if (d.get("split_strategy") or "page") == "page"]
+            passport_docs = [d for d in page_docs if d.get("doc_type") == "passport"]
+            if page_docs and passport_docs:
+                passport_ratio = len(passport_docs) / max(1, len(page_docs))
+                if passport_ratio >= 0.5:
+                    passport_pages = set()
+                    for d in passport_docs:
+                        for p in (d.get("pages") or []):
+                            passport_pages.add(int(p))
 
-                for d in page_docs:
-                    if d.get("doc_type") != "other_documents":
-                        continue
-                    conf = float(d.get("confidence") or 0.0)
-                    if conf >= 0.6:
-                        continue
-                    pages_list = d.get("pages") or []
-                    if not pages_list:
-                        continue
-                    p0 = int(pages_list[0])
-                    if any(abs(p0 - pp) <= 2 for pp in passport_pages):
-                        d["doc_type"] = "passport"
-                        d["needs_review"] = True
-    except Exception as e:
-        logger.warning(f"[Split] Passport page promotion heuristic failed: {e}")
+                    for d in page_docs:
+                        if d.get("doc_type") != "other_documents":
+                            continue
+                        conf = float(d.get("confidence") or 0.0)
+                        if conf >= 0.6:
+                            continue
+                        pages_list = d.get("pages") or []
+                        if not pages_list:
+                            continue
+                        p0 = int(pages_list[0])
+                        if any(abs(p0 - pp) <= 2 for pp in passport_pages):
+                            d["doc_type"] = "passport"
+                            d["needs_review"] = True
+        except Exception as e:
+            logger.warning(f"[Split] Passport page promotion heuristic failed: {e}")
 
     # Heuristic: prevent CV sections from being split into standalone docs.
     # If many pages are classified as cv_resume, then nearby low/medium-confidence
     # educational/experience/professional certificate pages are likely CV sections.
-    try:
-        page_docs = [d for d in documents if (d.get("split_strategy") or "page") == "page"]
-        cv_docs = [d for d in page_docs if d.get("doc_type") == "cv_resume"]
-        if page_docs and cv_docs:
-            cv_ratio = len(cv_docs) / max(1, len(page_docs))
-            cv_pages = set(int(p) for d in cv_docs for p in (d.get("pages") or []))
+    if not exhaustive_page_scan:
+        try:
+            page_docs = [d for d in documents if (d.get("split_strategy") or "page") == "page"]
+            cv_docs = [d for d in page_docs if d.get("doc_type") == "cv_resume"]
+            if page_docs and cv_docs:
+                cv_ratio = len(cv_docs) / max(1, len(page_docs))
+                cv_pages = set(int(p) for d in cv_docs for p in (d.get("pages") or []))
 
-            # Strong signal if 2+ pages are CV, or CV is a big share.
-            if len(cv_docs) >= 2 or cv_ratio >= 0.4:
-                for d in page_docs:
-                    dtype = d.get("doc_type") or "other_documents"
-                    if dtype not in {"educational_documents", "experience_certificates", "certificates"}:
-                        continue
-                    conf = float(d.get("confidence") or 0.0)
-                    # If the model is extremely confident it's a standalone doc, keep it.
-                    if conf >= 0.92:
-                        continue
-                    pages_list = d.get("pages") or []
-                    if not pages_list:
-                        continue
-                    p0 = int(pages_list[0])
-                    if any(abs(p0 - cp) <= 1 for cp in cv_pages):
-                        d["doc_type"] = "cv_resume"
-                        d["needs_review"] = True
-    except Exception as e:
-        logger.warning(f"[Split] CV page promotion heuristic failed: {e}")
+                # Strong signal if 2+ pages are CV, or CV is a big share.
+                if len(cv_docs) >= 2 or cv_ratio >= 0.4:
+                    for d in page_docs:
+                        dtype = d.get("doc_type") or "other_documents"
+                        if dtype not in {"educational_documents", "experience_certificates", "certificates"}:
+                            continue
+                        conf = float(d.get("confidence") or 0.0)
+                        # If the model is extremely confident it's a standalone doc, keep it.
+                        if conf >= 0.92:
+                            continue
+                        pages_list = d.get("pages") or []
+                        if not pages_list:
+                            continue
+                        p0 = int(pages_list[0])
+                        if any(abs(p0 - cp) <= 1 for cp in cv_pages):
+                            d["doc_type"] = "cv_resume"
+                            d["needs_review"] = True
+        except Exception as e:
+            logger.warning(f"[Split] CV page promotion heuristic failed: {e}")
 
     # Phase 2: group consecutive full-page units (same doc_type) -> one PDF per group, split_strategy "grouped"
     if not exhaustive_page_scan:
