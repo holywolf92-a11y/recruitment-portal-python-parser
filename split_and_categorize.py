@@ -17,6 +17,8 @@ import os
 import re
 from typing import Any, Optional
 
+from extract_photos_v2 import extract_embedded_image_candidates_from_pdf_page
+
 logger = logging.getLogger(__name__)
 
 GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")
@@ -623,6 +625,27 @@ def pdf_to_page_images(pdf_bytes: bytes) -> list[tuple[int, bytes]]:
     return result
 
 
+def _looks_like_photo_only_pdf_page(pdf_bytes: bytes, page_idx: int, raw_text: str) -> bool:
+    text = (raw_text or "").strip()
+    if text:
+        return False
+
+    try:
+        candidates = extract_embedded_image_candidates_from_pdf_page(pdf_bytes, page_idx)
+    except Exception:
+        return False
+
+    if len(candidates) != 1:
+        return False
+
+    candidate = candidates[0]
+    if candidate.width < 500 or candidate.height < 500:
+        return False
+
+    aspect_ratio = candidate.width / max(1, candidate.height)
+    return 0.75 <= aspect_ratio <= 0.95
+
+
 def image_to_page_images(img_bytes: bytes) -> list[tuple[int, bytes]]:
     """Single image -> one 'page'."""
     return [(0, img_bytes)]
@@ -1181,6 +1204,12 @@ async def _process_page_vision_only(
     cat = v.get("category") or "other_documents"
     conf = float(v.get("confidence") or 0.0)
     identity = v.get("extracted_identity") or {}
+    raw_text = v.get("raw_text") or ""
+
+    if is_pdf and pdf_bytes and _looks_like_photo_only_pdf_page(pdf_bytes, page_idx, raw_text):
+        pdf_one = extract_pages_as_pdf_bytes(pdf_bytes, [page_idx])
+        _append_doc(documents, "photos", 0.95, _normalize_identity({}), pdf_one, page_idx, [], "page", image_bytes=img_bytes)
+        return
 
     if layout != "multi" or len(raw_regions) < 2:
         cat, conf = apply_confidence_gate(cat, conf)
