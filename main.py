@@ -2455,6 +2455,340 @@ async def extract_profile_photo_from_pdf(pdf_content: bytes, attachment_id: str,
         return None  # Graceful fallback - don't fail CV parsing if photo extraction fails
 
 
+# ---------------------------------------------------------------------------
+# Employer-Safe CV Sanitization
+# ---------------------------------------------------------------------------
+
+FALISHA_EMAIL = "support@falishajobs.com"
+FALISHA_PHONE = "+92 330 3333335"
+FALISHA_WHATSAPP = "+923303333335"
+FALISHA_BANNER_TEXT = (
+    f"Presented by Falisha Manpower Recruitment Agency  |  "
+    f"Contact: {FALISHA_EMAIL}  |  WhatsApp: {FALISHA_PHONE}"
+)
+FALISHA_FOOTER_TEXT = f"Falisha Manpower  |  {FALISHA_EMAIL}  |  {FALISHA_PHONE}"
+CONTACT_REPLACEMENT = "Contact via Falisha"
+
+# Patterns that identify candidate direct-contact details
+_CV_EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
+_CV_PHONE_RE = re.compile(
+    r'(\+?92[\s\-]?\d{3}[\s\-]?\d{7,8})'          # Pakistan +92 / 092
+    r'|(\b0\d{2,3}[\s\-]?\d{6,8}\b)'               # 03xx 1234567, 021-1234567
+    r'|(\+\d{1,3}[\s\-]\d{3,5}[\s\-]\d{4,9})'     # international +X XXX XXXXXXX
+    r'|(\b\d{4}[\s\-]\d{7}\b)',                     # 0300 1234567 style
+)
+_CV_LINKEDIN_RE = re.compile(r'linkedin\.com/in/[a-zA-Z0-9_\-]+', re.IGNORECASE)
+
+# Minimum chars extracted by PyMuPDF before we consider a PDF "digital"
+_DIGITAL_MIN_CHARS = 80
+
+
+def _span_has_contact(text: str) -> bool:
+    """Return True if a text span contains an email, phone, or LinkedIn URL."""
+    t = text.strip()
+    if not t:
+        return False
+    if _CV_EMAIL_RE.search(t):
+        return True
+    if _CV_PHONE_RE.search(t):
+        return True
+    if _CV_LINKEDIN_RE.search(t):
+        return True
+    return False
+
+
+def _add_falisha_banners(doc: "fitz.Document") -> None:  # type: ignore[name-defined]
+    """
+    Add a coloured top banner (page 1) and a footer (every page) to a fitz PDF document.
+    The banner/footer are drawn OVER existing content so they are always visible.
+    """
+    BANNER_H = 30   # points  (~10 mm)
+    FOOTER_H = 22   # points  (~7.5 mm)
+    BANNER_FILL = (0.0, 0.36, 0.57)    # #005C91  Falisha dark-blue
+    FOOTER_FILL = (0.10, 0.10, 0.10)   # very dark grey
+    WHITE = (1.0, 1.0, 1.0)
+
+    for page_num, page in enumerate(doc):
+        w = page.rect.width
+        h = page.rect.height
+
+        if page_num == 0:
+            # Top banner — drawn last so it sits on top
+            banner_rect = fitz.Rect(0, 0, w, BANNER_H)
+            page.draw_rect(banner_rect, color=BANNER_FILL, fill=BANNER_FILL, overlay=True)
+            page.insert_textbox(
+                fitz.Rect(8, 5, w - 8, BANNER_H - 4),
+                FALISHA_BANNER_TEXT,
+                fontsize=7.2,
+                color=WHITE,
+                align=fitz.TEXT_ALIGN_LEFT,
+                overlay=True,
+            )
+
+        # Footer — every page
+        footer_rect = fitz.Rect(0, h - FOOTER_H, w, h)
+        page.draw_rect(footer_rect, color=FOOTER_FILL, fill=FOOTER_FILL, overlay=True)
+        page.insert_textbox(
+            fitz.Rect(8, h - FOOTER_H + 4, w - 8, h - 4),
+            FALISHA_FOOTER_TEXT,
+            fontsize=7.0,
+            color=WHITE,
+            align=fitz.TEXT_ALIGN_CENTER,
+            overlay=True,
+        )
+
+
+def _sanitize_digital_pdf_sync(pdf_bytes: bytes) -> tuple[bytes, int]:
+    """
+    Sanitize a text-selectable PDF in-process using PyMuPDF.
+    Returns (sanitized_pdf_bytes, redacted_count).
+    Uses true PDF redaction (apply_redactions removes content from PDF stream).
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total_redacted = 0
+
+    for page in doc:
+        rects_to_redact: list[fitz.Rect] = []
+
+        for block in page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE).get("blocks", []):
+            if block.get("type") != 0:   # 0 = text block
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    span_text = span.get("text", "").strip()
+                    if not span_text:
+                        continue
+                    if _span_has_contact(span_text):
+                        bbox = span.get("bbox")
+                        if bbox:
+                            rects_to_redact.append(fitz.Rect(bbox))
+
+        if rects_to_redact:
+            for rect in rects_to_redact:
+                # Expand rect slightly so font ascenders/descenders are covered
+                expanded = fitz.Rect(rect.x0 - 1, rect.y0 - 2, rect.x1 + 60, rect.y1 + 2)
+                # fill=(0.94,0.94,0.94) light grey box; text is the short replacement label
+                page.add_redact_annot(
+                    expanded,
+                    text=CONTACT_REPLACEMENT,
+                    fontsize=7.5,
+                    fill=(0.94, 0.94, 0.94),
+                    text_color=(0.25, 0.25, 0.25),
+                )
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+            total_redacted += len(rects_to_redact)
+
+    _add_falisha_banners(doc)
+
+    out_bytes = doc.tobytes(garbage=4, deflate=True, clean=True)
+    doc.close()
+    return out_bytes, total_redacted
+
+
+async def _sanitize_scanned_pdf(pdf_bytes: bytes) -> tuple[bytes, int, str]:
+    """
+    Sanitize a scanned (image-only) PDF using Google Vision for OCR + bounding boxes,
+    then PIL for pixel-level redaction. Re-saves as rasterized PDF (no hidden text layer).
+    Returns (sanitized_pdf_bytes, redacted_count, status).
+    """
+    import io as _io
+    from PIL import Image as PILImage, ImageDraw
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total_pages = len(doc)
+    page_pil_images: list[PILImage.Image] = []
+    total_redacted = 0
+
+    RENDER_DPI = 150
+    scale = RENDER_DPI / 72
+
+    for page_num in range(total_pages):
+        page = doc[page_num]
+        mat = fitz.Matrix(scale, scale)
+        pix = page.get_pixmap(matrix=mat)
+        img_bytes = pix.tobytes("png")
+
+        pil_img = PILImage.open(_io.BytesIO(img_bytes)).convert("RGB")
+        draw = ImageDraw.Draw(pil_img)
+        img_w, img_h = pil_img.size
+
+        if GOOGLE_VISION_ENABLED:
+            vision_data = await _google_vision_annotate_image_bytes(
+                img_bytes,
+                [{"type": "DOCUMENT_TEXT_DETECTION"}],
+            )
+            full_ann = vision_data.get("fullTextAnnotation", {}) if vision_data else {}
+
+            for gv_page in full_ann.get("pages", []):
+                for block in gv_page.get("blocks", []):
+                    for paragraph in block.get("paragraphs", []):
+                        for word in paragraph.get("words", []):
+                            word_text = "".join(
+                                sym.get("text", "") for sym in word.get("symbols", [])
+                            )
+                            if not _span_has_contact(word_text):
+                                continue
+
+                            verts = word.get("boundingBox", {}).get("vertices", [])
+                            if len(verts) < 4:
+                                continue
+                            xs = [v.get("x", 0) for v in verts]
+                            ys = [v.get("y", 0) for v in verts]
+                            x0, y0, x1, y1 = min(xs) - 2, min(ys) - 2, max(xs) + 2, max(ys) + 2
+
+                            # Solid opaque fill — removes pixel-level content
+                            draw.rectangle([x0, y0, x1, y1], fill=(200, 200, 200))
+                            # Write short marker if there is enough width
+                            if (x1 - x0) > 40:
+                                draw.text((x0 + 2, y0 + 1), "Redacted", fill=(80, 80, 80))
+                            total_redacted += 1
+
+        # Add Falisha banner/footer as image overlays
+        BANNER_PIX_H = int(28 * scale)
+        FOOTER_PIX_H = int(20 * scale)
+        BANNER_COLOUR = (0, 92, 145)
+        FOOTER_COLOUR = (26, 26, 26)
+        WHITE_COLOUR = (255, 255, 255)
+
+        if page_num == 0:
+            draw.rectangle([0, 0, img_w, BANNER_PIX_H], fill=BANNER_COLOUR)
+            draw.text((8, 6), FALISHA_BANNER_TEXT, fill=WHITE_COLOUR)
+
+        draw.rectangle([0, img_h - FOOTER_PIX_H, img_w, img_h], fill=FOOTER_COLOUR)
+        draw.text((8, img_h - FOOTER_PIX_H + 4), FALISHA_FOOTER_TEXT, fill=WHITE_COLOUR)
+
+        page_pil_images.append(pil_img)
+
+    doc.close()
+
+    if not page_pil_images:
+        return pdf_bytes, 0, "failed"
+
+    out_buf = _io.BytesIO()
+    page_pil_images[0].save(
+        out_buf,
+        format="PDF",
+        save_all=True,
+        append_images=page_pil_images[1:],
+        resolution=RENDER_DPI,
+    )
+    status = "safe_generated" if total_redacted > 0 else "needs_manual_review"
+    return out_buf.getvalue(), total_redacted, status
+
+
+class SanitizeCvRequest(BaseModel):
+    file_content: str    # base64-encoded PDF bytes
+    file_name: str
+    mime_type: str = "application/pdf"
+    candidate_id: Optional[str] = None
+
+
+class SanitizeCvResponse(BaseModel):
+    success: bool
+    sanitized_content: Optional[str] = None   # base64-encoded sanitized PDF
+    method: Optional[str] = None              # 'digital_pdf' | 'scanned_ocr' | 'failed'
+    status: Optional[str] = None             # 'safe_generated' | 'needs_manual_review' | 'failed'
+    confidence_score: Optional[float] = None
+    redacted_count: int = 0
+    error: Optional[str] = None
+
+
+@app.post("/sanitize-cv", response_model=SanitizeCvResponse)
+async def sanitize_cv(
+    request: Request,
+    sanitize_request: SanitizeCvRequest,
+    x_hmac_signature: str = Header(None),
+):
+    """
+    Sanitize an original candidate CV PDF:
+    1. Detect and true-redact candidate contact details (email, phone, LinkedIn).
+    2. Replace redacted areas with a short 'Contact via Falisha' marker.
+    3. Add a Falisha contact banner on page 1 and a footer on every page.
+
+    Returns the sanitized PDF as base64 in `sanitized_content`.
+    """
+    if not x_hmac_signature:
+        return SanitizeCvResponse(success=False, error="Missing HMAC signature")
+
+    body = await request.body()
+    if not verify_hmac(x_hmac_signature, body):
+        return SanitizeCvResponse(success=False, error="Invalid HMAC signature")
+
+    try:
+        pdf_bytes = base64.b64decode(sanitize_request.file_content)
+    except Exception as decode_err:
+        return SanitizeCvResponse(success=False, error=f"base64 decode failed: {decode_err}")
+
+    candidate_id = sanitize_request.candidate_id or "unknown"
+    file_name = sanitize_request.file_name or "cv.pdf"
+
+    logger.info(f"[SanitizeCV] Starting sanitization: candidate={candidate_id} file={file_name} size={len(pdf_bytes)}")
+
+    try:
+        # --- Step 1: probe text layer ---
+        try:
+            probe_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            sample_text = "".join(
+                probe_doc[i].get_text() for i in range(min(2, len(probe_doc)))
+            )
+            probe_doc.close()
+        except Exception:
+            sample_text = ""
+
+        is_digital = len(sample_text.strip()) >= _DIGITAL_MIN_CHARS
+
+        if is_digital:
+            # --- Digital PDF: true fitz redaction ---
+            logger.info(f"[SanitizeCV] Digital PDF detected ({len(sample_text)} chars). Using fitz redaction.")
+            sanitized_bytes, redacted_count = _sanitize_digital_pdf_sync(pdf_bytes)
+            method = "digital_pdf"
+            status = "safe_generated"
+            confidence = 0.95
+        else:
+            # --- Scanned / image-only PDF ---
+            if GOOGLE_VISION_ENABLED:
+                logger.info(f"[SanitizeCV] Scanned PDF, Google Vision OCR enabled. Processing {file_name}.")
+                sanitized_bytes, redacted_count, status = await _sanitize_scanned_pdf(pdf_bytes)
+                method = "scanned_ocr"
+                confidence = 0.80 if redacted_count > 0 else 0.50
+            else:
+                # No OCR available — add banner/footer only, flag for manual review
+                logger.warning(f"[SanitizeCV] Scanned PDF but Google Vision not configured. Adding banner only.")
+                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                _add_falisha_banners(doc)
+                sanitized_bytes = doc.tobytes(garbage=4, deflate=True, clean=True)
+                doc.close()
+                redacted_count = 0
+                method = "scanned_banner_only"
+                status = "needs_manual_review"
+                confidence = 0.30
+
+        logger.info(
+            f"[SanitizeCV] Done: candidate={candidate_id} method={method} "
+            f"redacted={redacted_count} status={status} output_size={len(sanitized_bytes)}"
+        )
+
+        return SanitizeCvResponse(
+            success=True,
+            sanitized_content=base64.b64encode(sanitized_bytes).decode("utf-8"),
+            method=method,
+            status=status,
+            confidence_score=confidence,
+            redacted_count=redacted_count,
+        )
+
+    except Exception as exc:
+        import traceback as _tb
+        logger.error(f"[SanitizeCV] Unhandled error for candidate={candidate_id}: {exc}")
+        logger.error(_tb.format_exc())
+        return SanitizeCvResponse(
+            success=False,
+            error=str(exc),
+            method="failed",
+            status="failed",
+        )
+
+
 @app.post("/extract-photo", response_model=ExtractPhotoResponse)
 async def extract_photo(
     request: Request,
