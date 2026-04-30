@@ -24,7 +24,7 @@ if not _load:
     _fallback = _env_dir.parent / "Recruitment Automation Portal (2)" / "python-parser" / ".env"
     if _fallback.exists():
         load_dotenv(_fallback)
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from collections import OrderedDict
 import openai
 from datetime import datetime
@@ -2788,6 +2788,314 @@ async def sanitize_cv(
             method="failed",
             status="failed",
         )
+
+
+# ─── Employer Package: Models & Helpers ─────────────────────────────────────────
+
+_PACKAGE_DOC_ORDER: dict = {
+    'cv_resume': 0,
+    'passport': 1,
+    'cnic': 2,
+    'national_id': 2,
+    'driving_license': 3,
+    'educational_documents': 4,
+    'certificates': 4,
+    'experience_certificates': 5,
+    'experience_letters': 5,
+    'navttc_reports': 5,
+    'police_character_certificate': 6,
+    'pcc': 6,
+    'medical_reports': 7,
+    'medical': 7,
+    'photos': 8,
+    'photo': 8,
+    'contracts': 9,
+    'visa': 10,
+    'other_documents': 11,
+}
+
+_PACKAGE_DOC_DISPLAY: dict = {
+    'passport': 'Passport',
+    'cnic': 'CNIC / National ID',
+    'national_id': 'National ID',
+    'driving_license': 'Driving License',
+    'educational_documents': 'Educational Documents',
+    'certificates': 'Professional Certificates',
+    'experience_certificates': 'Experience Certificates',
+    'experience_letters': 'Experience Letters',
+    'navttc_reports': 'NAVTTC Reports',
+    'police_character_certificate': 'Police Character Certificate',
+    'pcc': 'Police Character Certificate',
+    'medical_reports': 'Medical Reports',
+    'medical': 'Medical Report',
+    'photos': 'Photos',
+    'photo': 'Photo',
+    'contracts': 'Contracts',
+    'visa': 'Visa',
+    'other_documents': 'Other Documents',
+}
+
+
+class DocumentForPackage(BaseModel):
+    content: str           # base64-encoded file bytes
+    file_name: str
+    mime_type: str = "application/pdf"
+    category: str = "other_documents"
+    display_name: Optional[str] = None
+
+
+class BuildEmployerPackageRequest(BaseModel):
+    sanitized_cv_content: str    # base64-encoded sanitized CV PDF
+    documents: List[DocumentForPackage] = []
+    candidate_name: str
+    candidate_code: Optional[str] = None
+    profession: Optional[str] = None
+    nationality: Optional[str] = None
+    generated_date: Optional[str] = None
+
+
+class BuildEmployerPackageResponse(BaseModel):
+    success: bool
+    package_content: Optional[str] = None   # base64 merged PDF
+    page_count: int = 0
+    included_documents: List[str] = []
+    error: Optional[str] = None
+
+
+def _pkg_sort_key(category: str) -> int:
+    return _PACKAGE_DOC_ORDER.get(category.lower(), 99)
+
+
+def _pkg_display(category: str, file_name: str) -> str:
+    return _PACKAGE_DOC_DISPLAY.get(category.lower(), category.replace('_', ' ').title())
+
+
+def _file_to_pdf_bytes(content_bytes: bytes, mime_type: str, file_name: str) -> Optional[bytes]:
+    """Convert file bytes to PDF bytes using fitz. Returns None if not convertible."""
+    lower = file_name.lower()
+    # Already PDF
+    if 'pdf' in mime_type or lower.endswith('.pdf'):
+        return content_bytes
+    # Images — fitz can open most formats and convert_to_pdf wraps them as PDF pages
+    is_image = (
+        mime_type.startswith('image/')
+        or any(lower.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif', '.gif'])
+    )
+    if is_image:
+        try:
+            img_doc = fitz.open(stream=content_bytes)
+            pdf_bytes = img_doc.convert_to_pdf()
+            img_doc.close()
+            return pdf_bytes
+        except Exception as e:
+            logger.warning(f"[EmployerPackage] Image→PDF conversion failed for {file_name}: {e}")
+            return None
+    logger.info(f"[EmployerPackage] Skipping non-convertible file: {file_name} ({mime_type})")
+    return None
+
+
+def _create_cover_page(
+    candidate_name: str,
+    profession: Optional[str],
+    nationality: Optional[str],
+    candidate_code: Optional[str],
+    generated_date: str,
+    included_doc_names: List[str],
+) -> fitz.Document:
+    """Build a professional A4 cover page using PyMuPDF."""
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)  # A4 portrait in points
+
+    FALISHA_BLUE = (0 / 255, 92 / 255, 145 / 255)
+    WHITE = (1.0, 1.0, 1.0)
+    DARK = (0.1, 0.1, 0.1)
+    MID = (0.35, 0.35, 0.35)
+    ACCENT = (0 / 255, 140 / 255, 200 / 255)
+
+    # ── Header bar ────────────────────────────────────────────────────────────
+    page.draw_rect(fitz.Rect(0, 0, 595, 108), color=FALISHA_BLUE, fill=FALISHA_BLUE, overlay=True)
+    page.insert_text(fitz.Point(30, 42), "FALISHA MANPOWER RECRUITMENT AGENCY",
+                     fontsize=14, color=WHITE, fontname="helv")
+    page.insert_text(fitz.Point(30, 63), "EMPLOYER CANDIDATE PACKAGE",
+                     fontsize=11, color=(0.75, 0.90, 1.0), fontname="helv")
+    page.insert_text(fitz.Point(30, 82), "www.falishajobs.com  |  support@falishajobs.com  |  +923303333335",
+                     fontsize=8, color=(0.65, 0.82, 0.95), fontname="helv")
+    page.insert_text(fitz.Point(30, 97), "Confidential — For Employer Use Only",
+                     fontsize=7.5, color=(0.55, 0.78, 0.92), fontname="helv")
+
+    # ── Candidate section ─────────────────────────────────────────────────────
+    y = 138
+    page.insert_text(fitz.Point(30, y), candidate_name or "Candidate",
+                     fontsize=22, color=DARK, fontname="helv")
+    y += 28
+    if profession:
+        page.insert_text(fitz.Point(30, y), profession, fontsize=13, color=MID, fontname="helv")
+        y += 20
+    if nationality:
+        page.insert_text(fitz.Point(30, y), f"Nationality: {nationality}",
+                         fontsize=10, color=MID, fontname="helv")
+        y += 18
+    if candidate_code:
+        page.insert_text(fitz.Point(30, y), f"Reference: {candidate_code}",
+                         fontsize=10, color=MID, fontname="helv")
+        y += 18
+
+    y += 14
+    page.draw_line(fitz.Point(30, y), fitz.Point(565, y), color=(0.80, 0.87, 0.93), width=1)
+    y += 22
+
+    # ── Documents list ────────────────────────────────────────────────────────
+    page.insert_text(fitz.Point(30, y), "INCLUDED DOCUMENTS",
+                     fontsize=11, color=ACCENT, fontname="helv")
+    y += 20
+    for i, doc_name in enumerate(included_doc_names, 1):
+        page.insert_text(fitz.Point(44, y), f"{i}.  {doc_name}",
+                         fontsize=10, color=DARK, fontname="helv")
+        y += 17
+
+    y += 14
+    page.draw_line(fitz.Point(30, y), fitz.Point(565, y), color=(0.80, 0.87, 0.93), width=1)
+    y += 20
+
+    # ── Generation info ───────────────────────────────────────────────────────
+    page.insert_text(fitz.Point(30, y), f"Generated: {generated_date}",
+                     fontsize=9, color=MID, fontname="helv")
+    y += 15
+    page.insert_text(fitz.Point(30, y),
+                     "This package is for employer review only. Contact Falisha Manpower for candidate inquiries.",
+                     fontsize=8, color=(0.55, 0.55, 0.55), fontname="helv")
+
+    # ── Footer bar ────────────────────────────────────────────────────────────
+    page.draw_rect(fitz.Rect(0, 800, 595, 842), color=FALISHA_BLUE, fill=FALISHA_BLUE, overlay=True)
+    page.insert_text(fitz.Point(30, 818),
+                     "CONFIDENTIAL — For employer review only | Falisha Manpower Recruitment System",
+                     fontsize=7.5, color=WHITE, fontname="helv")
+    page.insert_text(fitz.Point(30, 833),
+                     "© Falisha Manpower  |  All candidate information is private and confidential",
+                     fontsize=7.5, color=(0.7, 0.85, 1.0), fontname="helv")
+
+    return doc
+
+
+@app.post("/build-employer-package", response_model=BuildEmployerPackageResponse)
+async def build_employer_package(
+    request: Request,
+    pkg_request: BuildEmployerPackageRequest,
+    x_hmac_signature: str = Header(None),
+):
+    """
+    Build a complete Employer Candidate Package PDF:
+      1. Cover page with candidate details and document index
+      2. Sanitized CV (pre-sanitized by /sanitize-cv)
+      3. All other candidate documents (passport, CNIC, certificates, etc.) in priority order
+    Returns the merged PDF as base64 in `package_content`.
+    """
+    if not x_hmac_signature:
+        return BuildEmployerPackageResponse(success=False, error="Missing HMAC signature")
+
+    body = await request.body()
+    if not verify_hmac(x_hmac_signature, body):
+        return BuildEmployerPackageResponse(success=False, error="Invalid HMAC signature")
+
+    candidate_id_log = pkg_request.candidate_code or pkg_request.candidate_name or "unknown"
+    logger.info(f"[EmployerPackage] Building package for candidate={candidate_id_log} "
+                f"extra_docs={len(pkg_request.documents)}")
+
+    try:
+        # ── Decode sanitized CV ───────────────────────────────────────────────
+        try:
+            sanitized_cv_bytes = base64.b64decode(pkg_request.sanitized_cv_content)
+        except Exception as e:
+            return BuildEmployerPackageResponse(success=False, error=f"Failed to decode sanitized CV: {e}")
+
+        # ── Sort extra documents by category priority ─────────────────────────
+        sorted_docs = sorted(
+            pkg_request.documents,
+            key=lambda d: (_pkg_sort_key(d.category), d.file_name)
+        )
+
+        # ── Convert documents to PDF and collect display names ─────────────────
+        extra_pdf_parts: List[bytes] = []
+        included_names: List[str] = ["Employer-Safe CV"]  # CV is always first
+
+        for doc in sorted_docs:
+            try:
+                content_bytes = base64.b64decode(doc.content)
+            except Exception:
+                logger.warning(f"[EmployerPackage] Failed to base64-decode {doc.file_name}, skipping")
+                continue
+
+            pdf_bytes = _file_to_pdf_bytes(content_bytes, doc.mime_type, doc.file_name)
+            if pdf_bytes is None:
+                continue
+
+            extra_pdf_parts.append(pdf_bytes)
+            display = doc.display_name or _pkg_display(doc.category, doc.file_name)
+            included_names.append(display)
+
+        # ── Generated date ────────────────────────────────────────────────────
+        from datetime import datetime as _dt
+        generated_date = pkg_request.generated_date or _dt.now().strftime("%B %d, %Y")
+
+        # ── Build cover page ──────────────────────────────────────────────────
+        cover_doc = _create_cover_page(
+            candidate_name=pkg_request.candidate_name,
+            profession=pkg_request.profession,
+            nationality=pkg_request.nationality,
+            candidate_code=pkg_request.candidate_code,
+            generated_date=generated_date,
+            included_doc_names=included_names,
+        )
+
+        # ── Merge all parts ───────────────────────────────────────────────────
+        merged = fitz.open()
+
+        # 1. Cover page
+        merged.insert_pdf(cover_doc)
+        cover_doc.close()
+
+        # 2. Sanitized CV
+        try:
+            cv_doc = fitz.open(stream=sanitized_cv_bytes, filetype="pdf")
+            merged.insert_pdf(cv_doc)
+            cv_doc.close()
+        except Exception as e:
+            merged.close()
+            return BuildEmployerPackageResponse(
+                success=False, error=f"Failed to insert sanitized CV into package: {e}"
+            )
+
+        # 3. Extra documents
+        for i, part_bytes in enumerate(extra_pdf_parts):
+            try:
+                part_doc = fitz.open(stream=part_bytes, filetype="pdf")
+                merged.insert_pdf(part_doc)
+                part_doc.close()
+            except Exception as e:
+                logger.warning(f"[EmployerPackage] Skipping document part {i} due to error: {e}")
+                continue
+
+        page_count = len(merged)
+        final_bytes = merged.tobytes(garbage=4, deflate=True, clean=True)
+        merged.close()
+
+        logger.info(
+            f"[EmployerPackage] Done: candidate={candidate_id_log} "
+            f"pages={page_count} docs={len(included_names)} size={len(final_bytes)}"
+        )
+
+        return BuildEmployerPackageResponse(
+            success=True,
+            package_content=base64.b64encode(final_bytes).decode("utf-8"),
+            page_count=page_count,
+            included_documents=included_names,
+        )
+
+    except Exception as exc:
+        import traceback as _tb
+        logger.error(f"[EmployerPackage] Unhandled error for candidate={candidate_id_log}: {exc}")
+        logger.error(_tb.format_exc())
+        return BuildEmployerPackageResponse(success=False, error=str(exc))
 
 
 @app.post("/extract-photo", response_model=ExtractPhotoResponse)
