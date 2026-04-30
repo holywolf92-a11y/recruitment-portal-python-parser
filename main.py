@@ -2474,7 +2474,8 @@ _CV_EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
 _CV_PHONE_RE = re.compile(
     r'(\+?92[\s\-]?\d{3}[\s\-]?\d{7,8})'          # Pakistan +92 / 092
     r'|(\b0\d{2,3}[\s\-]?\d{6,8}\b)'               # 03xx 1234567, 021-1234567
-    r'|(\+\d{1,3}[\s\-]\d{3,5}[\s\-]\d{4,9})'     # international +X XXX XXXXXXX
+    r'|(\+\d{1,3}[\s\-]\d{3,5}[\s\-]\d{4,9})'     # international +X XXX XXXXXXX (with spaces)
+    r'|(\+\d{7,15}\b)'                               # international no-space: +97452027739, +971501234567
     r'|(\b\d{4}[\s\-]\d{7}\b)',                     # 0300 1234567 style
 )
 _CV_LINKEDIN_RE = re.compile(r'linkedin\.com/in/[a-zA-Z0-9_\-]+', re.IGNORECASE)
@@ -2513,9 +2514,9 @@ def _add_falisha_banners(doc: "fitz.Document") -> None:  # type: ignore[name-def
         h = page.rect.height
 
         if page_num == 0:
-            # Top banner — drawn last so it sits on top
+            # Top banner — 50% transparent so candidate name behind it remains readable
             banner_rect = fitz.Rect(0, 0, w, BANNER_H)
-            page.draw_rect(banner_rect, color=BANNER_FILL, fill=BANNER_FILL, overlay=True)
+            page.draw_rect(banner_rect, color=BANNER_FILL, fill=BANNER_FILL, fill_opacity=0.5, overlay=True)
             page.insert_textbox(
                 fitz.Rect(8, 5, w - 8, BANNER_H - 4),
                 FALISHA_BANNER_TEXT,
