@@ -2554,7 +2554,7 @@ def _add_falisha_banners(doc: "fitz.Document") -> None:  # type: ignore[name-def
         )
 
 
-def _sanitize_digital_pdf_sync(pdf_bytes: bytes) -> tuple[bytes, int]:
+def _sanitize_digital_pdf_sync(pdf_bytes: bytes, add_branding: bool = True) -> tuple[bytes, int]:
     """
     Sanitize a text-selectable PDF in-process using PyMuPDF.
     Returns (sanitized_pdf_bytes, redacted_count).
@@ -2596,14 +2596,15 @@ def _sanitize_digital_pdf_sync(pdf_bytes: bytes) -> tuple[bytes, int]:
             page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
             total_redacted += len(rects_to_redact)
 
-    _add_falisha_banners(doc)
+    if add_branding:
+        _add_falisha_banners(doc)
 
     out_bytes = doc.tobytes(garbage=4, deflate=True, clean=True)
     doc.close()
     return out_bytes, total_redacted
 
 
-async def _sanitize_scanned_pdf(pdf_bytes: bytes) -> tuple[bytes, int, str]:
+async def _sanitize_scanned_pdf(pdf_bytes: bytes, add_branding: bool = True) -> tuple[bytes, int, str]:
     """
     Sanitize a scanned (image-only) PDF using Google Vision for OCR + bounding boxes,
     then PIL for pixel-level redaction. Re-saves as rasterized PDF (no hidden text layer).
@@ -2668,19 +2669,20 @@ async def _sanitize_scanned_pdf(pdf_bytes: bytes) -> tuple[bytes, int, str]:
                                 draw.text((x0 + 2, y0 + 1), "Redacted", fill=(80, 80, 80))
                             total_redacted += 1
 
-        # Add Falisha banner/footer as image overlays
-        BANNER_PIX_H = int(28 * scale)
-        FOOTER_PIX_H = int(20 * scale)
-        BANNER_COLOUR = (0, 92, 145)
-        FOOTER_COLOUR = (26, 26, 26)
-        WHITE_COLOUR = (255, 255, 255)
+        if add_branding:
+            # Add Falisha banner/footer as image overlays
+            BANNER_PIX_H = int(28 * scale)
+            FOOTER_PIX_H = int(20 * scale)
+            BANNER_COLOUR = (0, 92, 145)
+            FOOTER_COLOUR = (26, 26, 26)
+            WHITE_COLOUR = (255, 255, 255)
 
-        if page_num == 0:
-            draw.rectangle([0, 0, img_w, BANNER_PIX_H], fill=BANNER_COLOUR)
-            draw.text((8, 6), FALISHA_BANNER_TEXT, fill=WHITE_COLOUR)
+            if page_num == 0:
+                draw.rectangle([0, 0, img_w, BANNER_PIX_H], fill=BANNER_COLOUR)
+                draw.text((8, 6), FALISHA_BANNER_TEXT, fill=WHITE_COLOUR)
 
-        draw.rectangle([0, img_h - FOOTER_PIX_H, img_w, img_h], fill=FOOTER_COLOUR)
-        draw.text((8, img_h - FOOTER_PIX_H + 4), FALISHA_FOOTER_TEXT, fill=WHITE_COLOUR)
+            draw.rectangle([0, img_h - FOOTER_PIX_H, img_w, img_h], fill=FOOTER_COLOUR)
+            draw.text((8, img_h - FOOTER_PIX_H + 4), FALISHA_FOOTER_TEXT, fill=WHITE_COLOUR)
 
         page_pil_images.append(pil_img)
 
@@ -2918,6 +2920,29 @@ def _file_to_pdf_bytes(content_bytes: bytes, mime_type: str, file_name: str) -> 
     return None
 
 
+async def _sanitize_package_document_pdf(pdf_bytes: bytes, file_name: str) -> tuple[bytes, int, str]:
+    try:
+        probe_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        sample_text = "".join(
+            probe_doc[i].get_text() for i in range(min(2, len(probe_doc)))
+        )
+        probe_doc.close()
+    except Exception as probe_err:
+        logger.warning(f"[EmployerPackage] Could not probe {file_name} before redaction: {probe_err}")
+        sample_text = ""
+
+    is_digital = len(sample_text.strip()) >= _DIGITAL_MIN_CHARS
+    if is_digital:
+        sanitized_bytes, redacted_count = _sanitize_digital_pdf_sync(pdf_bytes, add_branding=False)
+        return sanitized_bytes, redacted_count, "digital_pdf"
+
+    if GOOGLE_VISION_ENABLED:
+        sanitized_bytes, redacted_count, status = await _sanitize_scanned_pdf(pdf_bytes, add_branding=False)
+        return sanitized_bytes, redacted_count, f"scanned_ocr:{status}"
+
+    return pdf_bytes, 0, "not_scanned_no_ocr"
+
+
 def _create_cover_page(
     candidate_name: str,
     profession: Optional[str],
@@ -3040,6 +3065,7 @@ async def build_employer_package(
 
         # ── Convert documents to PDF and collect display names ─────────────────
         extra_pdf_parts: List[bytes] = []
+        extra_redacted_total = 0
         included_names: List[str] = ["Employer-Safe CV"]  # CV is always first
 
         for doc in sorted_docs:
@@ -3052,6 +3078,14 @@ async def build_employer_package(
             pdf_bytes = _file_to_pdf_bytes(content_bytes, doc.mime_type, doc.file_name)
             if pdf_bytes is None:
                 continue
+
+            pdf_bytes, redacted_count, redact_method = await _sanitize_package_document_pdf(pdf_bytes, doc.file_name)
+            extra_redacted_total += redacted_count
+            if redacted_count:
+                logger.info(
+                    f"[EmployerPackage] Redacted {redacted_count} contact fragment(s) "
+                    f"from extra document {doc.file_name} via {redact_method}"
+                )
 
             extra_pdf_parts.append(pdf_bytes)
             display = doc.display_name or _pkg_display(doc.category, doc.file_name)
@@ -3105,7 +3139,7 @@ async def build_employer_package(
 
         logger.info(
             f"[EmployerPackage] Done: candidate={candidate_id_log} "
-            f"pages={page_count} docs={len(included_names)} size={len(final_bytes)}"
+            f"pages={page_count} docs={len(included_names)} extra_redacted={extra_redacted_total} size={len(final_bytes)}"
         )
 
         return BuildEmployerPackageResponse(
