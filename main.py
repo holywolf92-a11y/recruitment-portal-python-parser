@@ -2472,13 +2472,18 @@ CONTACT_REPLACEMENT = "Contact via Falisha"
 # Patterns that identify candidate direct-contact details
 _CV_EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
 _CV_PHONE_RE = re.compile(
-    r'(\+?92[\s\-]?\d{3}[\s\-]?\d{7,8})'          # Pakistan +92 / 092
-    r'|(\b0\d{2,3}[\s\-]?\d{6,8}\b)'               # 03xx 1234567, 021-1234567
-    r'|(\+\d{1,3}[\s\-]\d{3,5}[\s\-]\d{4,9})'     # international +X XXX XXXXXXX (with spaces)
-    r'|(\+\d{7,15}\b)'                               # international no-space: +97452027739, +971501234567
-    r'|(\b\d{4}[\s\-]\d{7}\b)',                     # 0300 1234567 style
+    r'(?:'
+    # Pakistan numbers, including (+92) 3xx..., +92-..., 0092..., and local 03xx...
+    r'(?:\(\s*(?:\+|00)?92\s*\)|(?:\+|00)?92)[\s\-]*(?:\(?\d{2,4}\)?[\s\-]*)?\d{3,4}[\s\-]*\d{3,5}'
+    r'|\b0?3\d{2}[\s\-]?\d{7}\b'
+    r'|\b0\d{2,3}[\s\-]?\d{6,8}\b'
+    # International numbers where the subscriber groups may be 2-4 digits each: +966 57 521 4645
+    r'|\+\d{1,3}(?:[\s\-]?\d{1,4}){2,4}\b'
+    r'|\+\d{7,15}\b'
+    r')'
 )
 _CV_LINKEDIN_RE = re.compile(r'linkedin\.com/in/[a-zA-Z0-9_\-]+', re.IGNORECASE)
+_CV_CONTACT_FRAGMENT_RE = re.compile(r'@|linkedin\.com|(?:\+|00)?\d|\(\s*\+?\d', re.IGNORECASE)
 
 # Minimum chars extracted by PyMuPDF before we consider a PDF "digital"
 _DIGITAL_MIN_CHARS = 80
@@ -2496,6 +2501,16 @@ def _span_has_contact(text: str) -> bool:
     if _CV_LINKEDIN_RE.search(t):
         return True
     return False
+
+
+def _span_may_be_contact_fragment(text: str) -> bool:
+    """Return True for span/word fragments that are likely part of a detected contact line."""
+    t = text.strip()
+    if not t:
+        return False
+    if _span_has_contact(t):
+        return True
+    return bool(_CV_CONTACT_FRAGMENT_RE.search(t))
 
 
 def _add_falisha_banners(doc: "fitz.Document") -> None:  # type: ignore[name-defined]
@@ -2555,11 +2570,13 @@ def _sanitize_digital_pdf_sync(pdf_bytes: bytes) -> tuple[bytes, int]:
             if block.get("type") != 0:   # 0 = text block
                 continue
             for line in block.get("lines", []):
-                for span in line.get("spans", []):
+                spans = [span for span in line.get("spans", []) if span.get("text", "").strip()]
+                line_text = " ".join(span.get("text", "").strip() for span in spans)
+                line_has_contact = _span_has_contact(line_text)
+
+                for span in spans:
                     span_text = span.get("text", "").strip()
-                    if not span_text:
-                        continue
-                    if _span_has_contact(span_text):
+                    if _span_has_contact(span_text) or (line_has_contact and _span_may_be_contact_fragment(span_text)):
                         bbox = span.get("bbox")
                         if bbox:
                             rects_to_redact.append(fitz.Rect(bbox))
@@ -2623,11 +2640,18 @@ async def _sanitize_scanned_pdf(pdf_bytes: bytes) -> tuple[bytes, int, str]:
             for gv_page in full_ann.get("pages", []):
                 for block in gv_page.get("blocks", []):
                     for paragraph in block.get("paragraphs", []):
+                        paragraph_words = []
                         for word in paragraph.get("words", []):
                             word_text = "".join(
                                 sym.get("text", "") for sym in word.get("symbols", [])
                             )
-                            if not _span_has_contact(word_text):
+                            paragraph_words.append((word, word_text))
+
+                        paragraph_text = " ".join(text for _, text in paragraph_words)
+                        paragraph_has_contact = _span_has_contact(paragraph_text)
+
+                        for word, word_text in paragraph_words:
+                            if not (_span_has_contact(word_text) or (paragraph_has_contact and _span_may_be_contact_fragment(word_text))):
                                 continue
 
                             verts = word.get("boundingBox", {}).get("vertices", [])
