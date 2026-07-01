@@ -3,6 +3,7 @@ import json
 import sys
 from typing import Dict, Any
 from openai import OpenAI
+from openai_retry import chat_completion_with_retry
 import PyPDF2
 import docx
 import requests
@@ -145,7 +146,8 @@ def extract_cv_data(cv_url: str) -> Dict[str, Any]:
     
     try:
         # Call OpenAI API
-        response = client.chat.completions.create(
+        response = chat_completion_with_retry(
+            client=client,
             model="gpt-4o-mini",
             messages=[
                 {

@@ -27,6 +27,7 @@ if not _load:
 from typing import Optional, Dict, Any, List
 from collections import OrderedDict
 import openai
+from openai_retry import chat_completion_with_retry
 from datetime import datetime
 
 from split_and_categorize import run_split_and_categorize
@@ -286,7 +287,7 @@ Return ONLY valid JSON:
 }}
 """
 
-        response = openai.chat.completions.create(
+        response = chat_completion_with_retry(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a precise document classifier that returns only valid JSON."},
@@ -687,7 +688,7 @@ async def parse_cv_with_openai(content: str, filename: str) -> dict:
     try:
         prompt = build_cv_prompt(content, from_images=False)
 
-        response = openai.chat.completions.create(
+        response = chat_completion_with_retry(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a precise CV parser that returns only valid JSON."},
@@ -954,7 +955,7 @@ async def parse_cv_with_vision(file_content: bytes, filename: str, max_pages: in
         async def run_vision_parse(images_payload):
             prompt = build_cv_prompt("", from_images=True)
             logger.info(f"[CVVision] Calling OpenAI Vision API ({CV_VISION_MODEL}) with {len(images_payload)} image(s)")
-            response = openai.chat.completions.create(
+            response = chat_completion_with_retry(
                 model=CV_VISION_MODEL,
                 messages=[
                     {"role": "system", "content": "You are a precise CV parser that returns only valid JSON."},
@@ -1057,7 +1058,7 @@ async def parse_cv_with_vision_image(file_content: bytes, filename: str, image_f
         
         # Call OpenAI Vision API
         logger.info(f"[CVVisionImage] Calling OpenAI Vision API ({CV_VISION_MODEL})")
-        response = openai.chat.completions.create(
+        response = chat_completion_with_retry(
             model=CV_VISION_MODEL,
             messages=[
                 {"role": "system", "content": "You are a precise CV parser that returns only valid JSON."},
@@ -1659,7 +1660,8 @@ Extract this information even if labels are slightly different."""
         
         logger.info(f"[VisionAPI] Calling OpenAI Vision API ({DOCUMENT_VISION_MODEL}) with {len(images)} image(s)")
         
-        response = client.chat.completions.create(
+        response = chat_completion_with_retry(
+            client=client,
             model=DOCUMENT_VISION_MODEL,
             messages=messages,
             temperature=0.1,
@@ -3346,7 +3348,7 @@ The document content is provided above - extract the information even if the for
 """
 
         # Call OpenAI
-        response = openai.chat.completions.create(
+        response = chat_completion_with_retry(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a document classification and identity extraction expert. Carefully read the document content and extract ALL identity fields. Return ONLY valid JSON."},
