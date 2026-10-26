@@ -44,6 +44,7 @@ import numpy as np  # For image arrays
 from scipy import ndimage  # For image processing
 from scipy.ndimage import gaussian_filter
 from enhance_nationality import enhance_nationality_with_ai
+from cv_field_cleanup import clean_cv_fields, is_internship_entry, is_course_entry
 from extract_photos_v2 import (
     extract_embedded_image_candidates_from_pdf_page,
     extract_displayed_image_candidates_from_pdf_page,
@@ -486,19 +487,21 @@ Return ONLY valid JSON:
 def build_cv_prompt(content: str, from_images: bool = False) -> str:
     # Keep the parser payload intentionally bounded so input-token spend stays predictable.
     content_section = "CV Images are attached." if from_images else f"CV Content:\n{content[:CV_PARSE_TEXT_INPUT_LIMIT]}"
+    today = datetime.now().strftime("%B %Y")
     return f"""
 You are a CV/Resume parser. Extract structured information from the following CV content.
-Return ONLY valid JSON with these exact fields (use null for missing data):
+Return ONLY valid JSON with these exact fields (use JSON null for missing data, never the string "null"):
 
 {{
-  "full_name": "string",
-  "email": "string or null",
-  "phone": "string or null",
+  "full_name": "string (the candidate's real name. If the header shows a nickname or honorific such as 'Shah Ji' or 'Bhai Jan' but the CV states the name elsewhere, e.g. 'My name is ...' or 'Mera naam ... hai', use the stated name)",
+  "email": "string or null (the candidate's OWN email from the CV header/contact section. A PDF may also contain experience certificates or letters from employers, hospitals or schools: never take an email from those, and never an organisation address such as info@, hr@, admin@)",
+  "phone": "string or null (the candidate's first phone number only - one number, not a list)",
   "location": "string or null",
-  "nationality": "string or null (country of origin/citizenship) - CRITICAL: Extract ONLY from 'Nationality:' or 'Citizenship:' field in personal info section. Do NOT use work experience locations (e.g., 'Worked in Saudi Arabia' is NOT nationality). Do NOT use country_of_interest. If CNIC format is Pakistani (13 digits) or Passport starts with PA/AB, nationality MUST be 'Pakistani'.",
-  "position": "string or null (desired job position/profession/title) - Normalize driver positions: HTV Driver, Heavy Duty Driver, Light Vehicle Driver, Simple Driver should all be normalized to 'Driver' or 'Driver (HTV)' if heavy vehicle",
-  "experience_years": "number or null (total years of professional work experience)",
-  "country_of_interest": "string or null (country they want to work in) - Extract from: 1) Objective/career goals (e.g., 'seeking opportunities in UAE'), 2) Work experience locations (if candidate worked in Gulf countries like Saudi Arabia, UAE, Qatar, Kuwait, Bahrain, Oman, that indicates country_of_interest). Do NOT confuse with nationality.",
+  "nationality": "string or null (country of origin/citizenship) - CRITICAL: Extract ONLY from 'Nationality:' or 'Citizenship:' field in personal info section. Do NOT use work experience locations (e.g., 'Worked in Saudi Arabia' is NOT nationality). Do NOT infer it from the phone country code or the current address (Pakistani workers in the Gulf have +966/+971 numbers and Gulf addresses). Do NOT use country_of_interest. If CNIC format is Pakistani (13 digits) or Passport starts with PA/AB, nationality MUST be 'Pakistani'.",
+  "position": "string or null (desired job position/profession/title) - In this order: 1) the headline/title under the candidate's name, 2) the role named in the objective or summary (e.g. 'Seeking a Plumber position' -> 'Plumber'), 3) the current job title, 4) the most recent job title. Only null when the CV names no role at all. Normalize driver positions: HTV Driver, Heavy Duty Driver, Light Vehicle Driver, Simple Driver should all be normalized to 'Driver' or 'Driver (HTV)' if heavy vehicle",
+  "experience_years": "number or null (total years of professional work experience; jobs marked Present/Current/Continue/Till date run until today, {today})",
+  "stated_experience_years": "number or null (ONLY when the CV states the total outright, e.g. '8 years of experience', '8 saal ka tajurba'; otherwise null)",
+  "country_of_interest": "string or null (country they want to work in, as country names only, e.g. 'UAE' or 'Saudi Arabia, Qatar'; map cities to their country, e.g. Dubai -> UAE) - Extract from: 1) Objective/career goals (e.g., 'seeking opportunities in UAE'), 2) Work experience locations (if candidate worked in Gulf countries like Saudi Arabia, UAE, Qatar, Kuwait, Bahrain, Oman, that indicates country_of_interest). Use null when no country is named (e.g. 'international opportunities', 'abroad', a job field). Do NOT confuse with nationality.",
   "linkedin_url": "string or null",
   "summary": "string or null",
   "professional_summary": "string or null (2-3 sentence career summary)",
@@ -514,7 +517,8 @@ Return ONLY valid JSON with these exact fields (use null for missing data):
       "company": "string",
       "location": "string or null",
       "start_date": "string or null",
-      "end_date": "string or null",
+      "end_date": "string or null ('Present' when the job is ongoing: Present, Current, Continue, Till date, To date)",
+      "duration": "string or null (only when the CV gives a duration instead of dates, e.g. '05 Months', '3 Years')",
       "description": "string or null"
     }}
   ],
@@ -539,7 +543,7 @@ Return ONLY valid JSON with these exact fields (use null for missing data):
     ],
   "certifications": ["array of strings"],
   "languages": ["array of strings"],
-  "previous_employment": "string or null (brief summary of work history)",
+  "previous_employment": "string or null (brief summary of past employers and roles, e.g. 'Electrician at X; Helper at Y'. Never the references line such as 'References will be provided on demand')",
   "passport_expiry": "string or null (format: YYYY-MM-DD)",
   "gcc_years": "number or null (total years of work experience in GCC countries: Saudi Arabia, UAE, Qatar, Kuwait, Bahrain, Oman) - Calculate from experience array by summing years worked in GCC locations"
 }}
@@ -551,8 +555,8 @@ IMPORTANT Guidelines:
 - Extract passport number from personal information, look for "Passport:", "Passport No:", "Passport Number:"
 - Extract date_of_birth from personal information, look for "DOB:", "Date of Birth:", "Birth Date:", "D.O.B:"
 - Extract marital_status from personal information, look for "Marital Status:", "Status:", or keywords like "Married", "Single", "Divorced"
-- Extract position from objective, desired role, or most recent job title
-- Calculate experience_years from work history timeline if not stated
+- Extract position from the headline under the name, the objective/desired role, the current job title, or the most recent job title (in that order)
+- Calculate experience_years from work history timeline if not stated; count ongoing jobs up to today ({today})
 - Extract country_of_interest from: 1) Objective/goal statements (e.g., "seeking opportunities in UAE"), 2) Work experience locations (if worked in Gulf countries, that's country_of_interest, not nationality)
 - Calculate gcc_years: Sum all years worked in GCC countries (Saudi Arabia, UAE, Qatar, Kuwait, Bahrain, Oman) from experience array
 - Normalize driver positions: HTV Driver, Heavy Duty Driver, Light Vehicle Driver, Simple Driver → "Driver" or "Driver (HTV)"
@@ -597,47 +601,26 @@ Format in experience array as regular experience entries, they will be filtered 
 Return only the JSON object, no explanation.
 """
 
-def post_process_cv_parsed_data(parsed_data: dict) -> dict:
+def post_process_cv_parsed_data(parsed_data: dict, raw_text: Optional[str] = None) -> dict:
     # Post-processing: Move courses from experience to certifications BEFORE normalization
     experience_array = parsed_data.get('experience', [])
     existing_certifications = parsed_data.get('certifications', [])
     if not isinstance(existing_certifications, list):
         existing_certifications = []
-    
-    internship_keywords = [
-        'intern', 'internship', 'internee', 'trainee', 'training', 'apprentice'
-    ]
-    course_keywords = [
-        'course', 'certification', 'certificate', 'workshop', 'seminar', 
-        'coursework', 'online course', 'certification program',
-        'diploma', 'certification course', 'professional course', 'training program'
-    ]
-    
+
     filtered_experience = []
     internships_list = []
-    
+
     if isinstance(experience_array, list):
         for exp in experience_array:
             if not isinstance(exp, dict):
                 filtered_experience.append(exp)
                 continue
-            
-            title = (exp.get('title') or '').lower()
-            company = (exp.get('company') or '').lower()
-            description = (exp.get('description') or '').lower()
-            full_text = f"{title} {company} {description}".lower()
 
-            # Check if this is an internship
-            is_internship = any(k in title for k in internship_keywords) or \
-                           any(k in company for k in internship_keywords) or \
-                           any(k in description for k in internship_keywords)
-            
-            # Check if this is a course/training - check for multi-word keywords too
-            is_course = False
-            for keyword in course_keywords:
-                if keyword in full_text:
-                    is_course = True
-                    break
+            # Decided on the title only, with whole words: "Redco International" or a
+            # description mentioning "training" used to turn real jobs into internships.
+            is_internship = is_internship_entry(exp)
+            is_course = is_course_entry(exp)
 
             # Handle internships and courses separately
             if is_internship:
@@ -666,6 +649,10 @@ def post_process_cv_parsed_data(parsed_data: dict) -> dict:
         parsed_data['certifications'] = existing_certifications
     if internships_list:
         parsed_data['internships'] = internships_list
+
+    # Deterministic field fixes (experience years from dates, phone, email,
+    # country_of_interest, position, name) - see cv_field_cleanup.py.
+    clean_cv_fields(parsed_data, raw_text)
 
     return parsed_data
 
@@ -710,31 +697,15 @@ async def parse_cv_with_openai(content: str, filename: str) -> dict:
 
         result_text = result_text.strip()
         parsed_data = json.loads(result_text)
-        parsed_data = post_process_cv_parsed_data(parsed_data)
+        # Includes driver-title normalization, experience_years / gcc_years from the
+        # experience dates, and the phone/email/country/name fixes.
+        parsed_data = post_process_cv_parsed_data(parsed_data, raw_text=content)
 
         # Evidence/audit trail for downstream completeness guards.
         # Keep truncated to avoid oversized payloads.
         if isinstance(content, str) and content:
             parsed_data['raw_text_length'] = len(content)
             parsed_data['raw_text'] = content[:CV_PARSE_TEXT_INPUT_LIMIT]
-        
-        # Post-processing: Normalize driver positions
-        position = parsed_data.get('position', '').strip() if parsed_data.get('position') else ''
-        if position:
-            position_lower = position.lower()
-            # Normalize all driver variants to "Driver"
-            driver_variants = ['htv driver', 'heavy duty driver', 'heavy vehicle driver', 
-                             'light vehicle driver', 'light duty driver', 'simple driver', 
-                             'driver', 'truck driver', 'bus driver', 'van driver']
-            if any(variant in position_lower for variant in driver_variants):
-                # Keep sub-type if present (e.g., "HTV Driver" -> "Driver (HTV)")
-                if 'htv' in position_lower or 'heavy' in position_lower:
-                    parsed_data['position'] = 'Driver (HTV)'
-                elif 'light' in position_lower:
-                    parsed_data['position'] = 'Driver (Light Vehicle)'
-                else:
-                    parsed_data['position'] = 'Driver'
-                logger.info(f"Normalized position from '{position}' to '{parsed_data['position']}'")
 
         # Keep education as a structured array (do not collapse to string).
         education_entries = parsed_data.get('education')
@@ -753,103 +724,9 @@ async def parse_cv_with_openai(content: str, filename: str) -> dict:
             parsed_data['education'] = []
         elif not isinstance(education_entries, list):
             parsed_data['education'] = []
-        
-        # Post-processing: Calculate GCC years from work experience
-        gcc_countries = ['saudi arabia', 'uae', 'united arab emirates', 'qatar', 'kuwait', 
-                        'bahrain', 'oman', 'gcc', 'gulf']
-        experience_array = parsed_data.get('experience', [])
-        gcc_years = 0
-        
-        if isinstance(experience_array, list):
-            for exp in experience_array:
-                if not isinstance(exp, dict):
-                    continue
-                location = (exp.get('location') or '').lower()
-                start_date = exp.get('start_date')
-                end_date = exp.get('end_date') or 'Present'
-                
-                # Check if location is in GCC
-                is_gcc = any(gcc_country in location for gcc_country in gcc_countries)
-                
-                if is_gcc and start_date:
-                    try:
-                        # Try to parse dates and calculate years
-                        # Simple year extraction (format: YYYY-MM-DD or YYYY)
-                        start_year = None
-                        end_year = None
-                        
-                        if '-' in start_date:
-                            start_year = int(start_date.split('-')[0])
-                        elif len(start_date) == 4 and start_date.isdigit():
-                            start_year = int(start_date)
-                        
-                        if end_date.lower() == 'present' or end_date.lower() == 'current':
-                            end_year = datetime.now().year
-                        elif '-' in end_date:
-                            end_year = int(end_date.split('-')[0])
-                        elif len(end_date) == 4 and end_date.isdigit():
-                            end_year = int(end_date)
-                        
-                        if start_year and end_year:
-                            years = max(0, end_year - start_year)
-                            gcc_years += years
-                    except (ValueError, AttributeError):
-                        # If date parsing fails, estimate 1 year per GCC job
-                        gcc_years += 1
-        
-        if gcc_years > 0:
-            parsed_data['gcc_years'] = gcc_years
-            logger.info(f"Calculated GCC years: {gcc_years} from work experience")
 
-        # Post-processing: Calculate total experience_years from work experience timeline
-        # Note: experience_array already has courses and internships removed (done early)
-        total_experience_years = 0
-        experience_array = parsed_data.get('experience', [])
-        
-        if isinstance(experience_array, list):
-            for exp in experience_array:
-                if not isinstance(exp, dict):
-                    continue
+        experience_array = parsed_data.get('experience') or []
 
-                start_date = exp.get('start_date')
-                end_date = exp.get('end_date') or 'Present'
-
-                if not start_date:
-                    # No explicit dates available - do not guess duration.
-                    continue
-
-                try:
-                    start_year = None
-                    end_year = None
-
-                    if '-' in start_date:
-                        start_year = int(start_date.split('-')[0])
-                    elif len(start_date) == 4 and start_date.isdigit():
-                        start_year = int(start_date)
-
-                    if isinstance(end_date, str) and (end_date.lower() == 'present' or end_date.lower() == 'current'):
-                        end_year = datetime.now().year
-                    elif isinstance(end_date, str) and '-' in end_date:
-                        end_year = int(end_date.split('-')[0])
-                    elif isinstance(end_date, str) and len(end_date) == 4 and end_date.isdigit():
-                        end_year = int(end_date)
-
-                    if start_year and end_year:
-                        total_experience_years += max(0, end_year - start_year)
-                except (ValueError, AttributeError):
-                    # Date parsing failed - do not guess duration.
-                    continue
-
-        if total_experience_years > 0:
-            try:
-                existing_experience = float(parsed_data.get('experience_years')) if parsed_data.get('experience_years') is not None else None
-            except (TypeError, ValueError):
-                existing_experience = None
-
-            if existing_experience is None:
-                parsed_data['experience_years'] = total_experience_years
-                logger.info(f"Calculated total experience_years: {total_experience_years} from work experience")
-        
         # Post-processing: Enhance country_of_interest from work experience
         if not parsed_data.get('country_of_interest') or parsed_data.get('country_of_interest') == 'missing':
             # Extract from work experience locations

@@ -2,6 +2,8 @@ import json
 import re
 from typing import Any, Dict, Optional, Tuple
 
+from cv_field_cleanup import normalize_phone_e164
+
 
 PLACEHOLDER_VALUES = {'', 'missing', 'null', 'undefined', 'n/a', 'na', 'none', 'not provided'}
 
@@ -36,18 +38,30 @@ PASSPORT_PREFIX_MAP = {
     'GB': 'United Kingdom',
 }
 
+# Only home countries of migrant workers. A Gulf number (+966, +971, ...) shows
+# where someone works, not their nationality: Pakistani workers in Saudi Arabia
+# use Saudi SIMs.
 PHONE_PREFIX_MAP = {
     '92': 'Pakistan',
     '91': 'India',
     '880': 'Bangladesh',
     '977': 'Nepal',
     '94': 'Sri Lanka',
-    '971': 'UAE',
-    '966': 'Saudi Arabia',
-    '974': 'Qatar',
-    '965': 'Kuwait',
-    '968': 'Oman',
-    '973': 'Bahrain',
+}
+
+GCC_NATIONALITIES = {'UAE', 'Saudi Arabia', 'Qatar', 'Kuwait', 'Oman', 'Bahrain'}
+
+# Words that show the CV is from someone living/studying/working in that country.
+# A phone code counts only together with one of these.
+COUNTRY_MENTION_TERMS = {
+    'Pakistan': ('pakistan', 'pakistani', 'karachi', 'lahore', 'islamabad', 'rawalpindi', 'peshawar',
+                 'faisalabad', 'multan', 'quetta', 'sialkot', 'gujranwala', 'hyderabad', 'punjab', 'sindh',
+                 'khyber pakhtunkhwa', 'balochistan', 'azad kashmir'),
+    'India': ('india', 'indian', 'delhi', 'mumbai', 'chennai', 'kerala', 'hyderabad', 'bangalore',
+              'bengaluru', 'kolkata', 'punjab'),
+    'Bangladesh': ('bangladesh', 'bangladeshi', 'dhaka', 'chittagong'),
+    'Nepal': ('nepal', 'nepali', 'nepalese', 'kathmandu'),
+    'Sri Lanka': ('sri lanka', 'sri lankan', 'colombo'),
 }
 
 
@@ -98,21 +112,57 @@ def _detect_passport_country(cv_data: Dict[str, Any]) -> Optional[Tuple[str, str
     return None
 
 
-def _detect_phone_country(cv_data: Dict[str, Any]) -> Optional[Tuple[str, str, float]]:
-    phone = _clean_text(cv_data.get('phone'))
-    if not phone:
-        return None
+def _cv_text(cv_data: Dict[str, Any]) -> str:
+    parts = [cv_data.get('raw_text'), cv_data.get('location')]
+    for key in ('experience', 'education'):
+        for entry in cv_data.get(key) or []:
+            if isinstance(entry, dict):
+                parts.extend([entry.get('location'), entry.get('company'), entry.get('institution')])
+    return ' '.join(p for p in parts if isinstance(p, str)).lower()
 
-    digits = re.sub(r'\D', '', phone)
-    digits = digits.lstrip('0')
-    for prefix in sorted(PHONE_PREFIX_MAP.keys(), key=len, reverse=True):
-        if digits.startswith(prefix):
-            return PHONE_PREFIX_MAP[prefix], 'phone_country_code', 0.75
+
+def _mentions_country(country: str, text: str) -> bool:
+    return any(re.search(r'\b' + re.escape(term) + r'\b', text) for term in COUNTRY_MENTION_TERMS.get(country, ()))
+
+
+def _detect_phone_country(cv_data: Dict[str, Any]) -> Optional[Tuple[str, str, float]]:
+    """
+    A phone country code alone is not evidence of nationality. Use it only for
+    the home countries in PHONE_PREFIX_MAP, and only when the CV also mentions
+    that country (address, schooling or employers).
+    """
+    phones = [cv_data.get('phone')] + list(cv_data.get('additional_phones') or [])
+    text = None
+    for phone in phones:
+        e164 = normalize_phone_e164(_clean_text(phone))
+        if not e164:
+            continue
+        digits = e164[1:]
+        for prefix in sorted(PHONE_PREFIX_MAP.keys(), key=len, reverse=True):
+            if digits.startswith(prefix):
+                country = PHONE_PREFIX_MAP[prefix]
+                text = _cv_text(cv_data) if text is None else text
+                if _mentions_country(country, text):
+                    return country, 'phone_country_code+cv_location', 0.8
+                break
     return None
+
+
+def _states_nationality(cv_data: Dict[str, Any], country: str) -> bool:
+    """True when the raw text has a 'Nationality: <country>' style statement, or there is no text to check."""
+    raw_text = cv_data.get('raw_text')
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        return True
+    words = [alias for alias, name in EXPLICIT_NATIONALITY_MAP.items() if name == country]
+    label = r'(?:nationality|citizenship|citizen)\W{0,30}'
+    return any(re.search(label + re.escape(word) + r'\b', raw_text, re.I) for word in words)
 
 
 def infer_nationality_from_cv_data(cv_data: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], float]:
     explicit = _normalize_explicit_nationality(cv_data.get('nationality'))
+    # The LLM sometimes turns a Saudi/UAE address or phone into a Gulf nationality.
+    if explicit in GCC_NATIONALITIES and not _states_nationality(cv_data, explicit):
+        explicit = None
     if explicit:
         return explicit, 'explicit', 0.99
 
@@ -131,6 +181,9 @@ def enhance_nationality_with_ai(cv_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     inferred_nationality, source, confidence = infer_nationality_from_cv_data(cv_data)
     if not inferred_nationality:
+        # Drop an unverified value (e.g. a Gulf nationality the CV never states).
+        if _clean_text(cv_data.get('nationality')):
+            cv_data['nationality'] = None
         return cv_data
 
     cv_data['nationality'] = inferred_nationality
