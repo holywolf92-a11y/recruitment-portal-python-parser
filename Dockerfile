@@ -6,11 +6,15 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies
-# libgl1-mesa-glx: needed by opencv-python-headless on Debian
-RUN apt-get update && apt-get install -y \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
+# Install system dependencies for opencv-python-headless (libGL + glib).
+# Robust against Debian bullseye repo drift that broke the old step:
+#  - --allow-releaseinfo-change: tolerate the suite's Release metadata moving
+#  - Acquire::Retries + --fix-missing: survive transient mirror fetch failures
+#  - libgl1 instead of the transitional libgl1-mesa-glx (always resolvable)
+RUN apt-get update -o Acquire::Retries=5 --allow-releaseinfo-change \
+    && apt-get install -y --no-install-recommends --fix-missing \
+       libgl1 \
+       libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
