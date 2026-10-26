@@ -6,16 +6,9 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies for opencv-python-headless (libGL + glib).
-# Robust against Debian bullseye repo drift that broke the old step:
-#  - --allow-releaseinfo-change: tolerate the suite's Release metadata moving
-#  - Acquire::Retries + --fix-missing: survive transient mirror fetch failures
-#  - libgl1 instead of the transitional libgl1-mesa-glx (always resolvable)
-RUN apt-get update -o Acquire::Retries=5 --allow-releaseinfo-change \
-    && apt-get install -y --no-install-recommends --fix-missing \
-       libgl1 \
-       libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+# No apt-get step: Debian bullseye is EOL and its security .debs were moved to
+# archive.debian.org, so `apt-get install` now fails with exit 100. Nothing here
+# needs system packages (all deps ship manylinux wheels; cv2 is not used).
 
 # Set working directory
 WORKDIR /app
@@ -34,8 +27,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the application code
 COPY . .
 
+# Fail the build (instead of the running service) if the app can't import/start.
+# Dummy secrets are inline so they never persist in the image.
+RUN PYTHON_HMAC_SECRET=build-smoke OPENAI_API_KEY=build-smoke python -c "import main; from fastapi.testclient import TestClient; r = TestClient(main.app).get('/health'); assert r.status_code == 200, r.text; print('BUILD SMOKE OK')" \
+    && pip check
+
 # Expose the port
 EXPOSE 8000
 
-# Command to run the application
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Command to run the application (exec so uvicorn receives SIGTERM)
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
